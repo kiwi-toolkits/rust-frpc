@@ -1,0 +1,76 @@
+[package]
+name = "rust-frpc"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "Apache-2.0"
+description = "A memory-frugal Rust implementation of frpc, wire-compatible with the Go frps"
+repository = "https://github.com/kiwi-toolkits/rust-frpc"
+readme = "README.md"
+keywords = ["frp", "tunnel", "proxy", "nat", "reverse-proxy"]
+categories = ["network-programming", "command-line-utilities"]
+
+[lib]
+name = "rust_frpc"
+path = "src/lib.rs"
+
+[[bin]]
+name = "frpc"
+path = "src/bin/frpc.rs"
+
+[[bin]]
+name = "rust-frpc"
+path = "src/bin/rust-frpc.rs"
+
+[dependencies]
+tokio = { version = "1", features = [
+    "rt",
+    "macros",
+    "net",
+    "io-util",
+    "time",
+    "sync",
+    "signal",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+bytes = "1"
+socket2 = "0.5"
+
+# frp's app-layer crypto: PBKDF2-HMAC-SHA1 -> AES-128-CFB.
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+hmac = "0.12"
+sha1 = "0.10"
+aes = "0.8"
+cfb-mode = "0.8"
+cipher = "0.4"
+md5 = "0.7"
+hex = "0.4"
+rand = "0.8"
+
+# `use_compression` on the frp wire is the snappy *framed* stream format.
+snap = "1"
+
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+thiserror = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "test-util", "process"] }
+
+# Size- and memory-oriented profile for the shipped binaries.
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# Development profile: same shape, faster to link, unwinding so a panic in a
+# test still prints a backtrace.
+[profile.release-fast]
+inherits = "release"
+opt-level = 2
+lto = "thin"
+codegen-units = 16
+panic = "unwind"

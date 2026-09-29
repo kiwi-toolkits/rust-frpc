@@ -1,0 +1,20 @@
+# frps for the integration test in tests/real_frps.rs.
+#
+# Ports are unusual on purpose so the test cannot collide with a real frps or
+# with a developer's own tunnel.
+bindAddr = "127.0.0.1"
+bindPort = 17000
+
+log.to = "console"
+log.level = "info"
+
+auth.method = "token"
+auth.token = "rust-frpc-integration"
+
+# Multiplexing stays on, because that is the client's default path and the one
+# worth testing.
+transport.tcpMux = true
+
+# Explicit rather than inherited from bindAddr, so the port a proxy is published
+# on is never in doubt.
+proxyBindAddr = "127.0.0.1"

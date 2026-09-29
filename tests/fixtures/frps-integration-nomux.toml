@@ -1,0 +1,18 @@
+# frps for the non-multiplexed half of tests/real_frps.rs.
+#
+# `transport.tcpMux` is a *server-side* decision: frps wraps each accepted
+# connection in yamux when its own setting is on, whatever the client thinks. A
+# client that disagrees therefore fails with an early EOF rather than a clear
+# error, so testing the non-multiplexed path needs a server that has it off.
+#
+# Port 17100 keeps it clear of the multiplexed fixture.
+bindAddr = "127.0.0.1"
+bindPort = 17100
+
+log.to = "console"
+log.level = "info"
+
+auth.method = "token"
+auth.token = "rust-frpc-integration"
+
+transport.tcpMux = false

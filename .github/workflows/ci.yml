@@ -1,0 +1,108 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # The release tag of `fatedier/frp` whose `frps` the end-to-end tests run
+  # against. Deliberately older than the dev branch this crate is written
+  # against: a client that works with an older server works with the newer one,
+  # and this is the version the local runs use.
+  FRP_TAG: v0.61.0
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --all-targets
+
+  test-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --all-targets
+
+  # The end-to-end tests, against a real `frps` built from source. This is the
+  # job that proves the compatibility claim, so it stands on its own rather than
+  # being folded into `check`: when it fails, the failure should read as "the
+  # client and the server disagree" and not as "one test in the suite failed".
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+
+      - name: Build frps
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "$FRP_TAG" \
+            https://github.com/fatedier/frp.git /tmp/frp
+          (cd /tmp/frp && go build -o "$GITHUB_WORKSPACE/frps" ./cmd/frps)
+          "$GITHUB_WORKSPACE/frps" --version
+
+      - name: Build frpc
+        run: cargo build --release
+
+      - name: Integration tests
+        env:
+          RUN_REAL_FRPS_TESTS: "1"
+          FRPS_CONFIG: tests/fixtures/frps-integration.toml
+          FRPS_BIN: ${{ github.workspace }}/frps
+          FRPC_BIN: ${{ github.workspace }}/target/release/frpc
+        # Single-threaded: every test binds the same fixture ports, so running
+        # them concurrently would have them racing for the listener.
+        run: cargo test --test real_frps -- --ignored --test-threads=1
+
+  # The memory budget, enforced rather than asserted in a README. Runs on Linux,
+  # which is where the < 5 MB idle target is stated and where the measurement is
+  # the working set.
+  memory:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+
+      - name: Build frps
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "$FRP_TAG" \
+            https://github.com/fatedier/frp.git /tmp/frp
+          (cd /tmp/frp && go build -o "$GITHUB_WORKSPACE/frps" ./cmd/frps)
+
+      - name: Build frpc
+        run: cargo build --release
+
+      - name: Memory budget
+        env:
+          RUN_REAL_FRPS_TESTS: "1"
+          FRPS_CONFIG: tests/fixtures/frps-integration.toml
+          FRPS_BIN: ${{ github.workspace }}/frps
+          FRPC_BIN: ${{ github.workspace }}/target/release/frpc
+        run: cargo test --test memory -- --ignored --nocapture --test-threads=1

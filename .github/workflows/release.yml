@@ -1,0 +1,133 @@
+name: Release
+
+# Dispatched by scripts/release.sh rather than triggered by a tag push, so the
+# commit that gets built is the one that was verified locally.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build and attach the artifacts to"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # Pinned to an exact tarball: the zig release asset naming changed between
+  # 0.14 and 0.15, so a floating version is not safe here.
+  ZIG_VERSION: 0.16.0
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    # Each target builds on its own OS. Cross-compiling to macOS or Windows from
+    # Linux is possible but needs the target's SDK, and a native runner is both
+    # simpler and free for a public repository.
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            name: linux-x86_64
+            zigbuild: true
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            name: linux-aarch64
+            zigbuild: true
+          # The board this crate is aimed at.
+          - os: ubuntu-latest
+            target: armv7-unknown-linux-musleabihf
+            name: linux-armv7
+            zigbuild: true
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            name: darwin-aarch64
+            zigbuild: false
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            name: windows-x86_64
+            zigbuild: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Prefer the dispatched tag; fall back to the ref for a manual run.
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install zig
+        if: matrix.zigbuild
+        run: |
+          set -euo pipefail
+          url="https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          curl --fail --location --silent --show-error "$url" -o /tmp/zig.tar.xz
+          mkdir -p "$HOME/zig"
+          tar -xJf /tmp/zig.tar.xz -C "$HOME/zig" --strip-components=1
+          echo "$HOME/zig" >> "$GITHUB_PATH"
+
+      - name: Install cargo-zigbuild
+        if: matrix.zigbuild
+        run: cargo install cargo-zigbuild --locked
+
+      - name: Build
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.zigbuild }}" = "true" ]; then
+            # Fat LTO over an ARM link can take an unbounded amount of time; a
+            # correct artifact matters more here than the last few hundred
+            # kilobytes.
+            export CARGO_PROFILE_RELEASE_LTO=off
+            export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
+            cargo zigbuild --release --target "${{ matrix.target }}" \
+              --bin frpc --bin rust-frpc
+          else
+            cargo build --release --target "${{ matrix.target }}" \
+              --bin frpc --bin rust-frpc
+          fi
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ github.event.inputs.tag }}"
+          version="${version#v}"
+          suffix=""
+          [ "${{ matrix.target }}" = "x86_64-pc-windows-msvc" ] && suffix=".exe"
+          out="rust-frpc_${version}_${{ matrix.name }}"
+          mkdir -p "dist/$out"
+          cp "target/${{ matrix.target }}/release/frpc$suffix" "dist/$out/"
+          cp "target/${{ matrix.target }}/release/rust-frpc$suffix" "dist/$out/"
+          cp README.md README_zh.md LICENSE CHANGELOG.md "dist/$out/"
+          cp -r conf doc "dist/$out/"
+          (cd dist && tar czf "$out.tar.gz" "$out")
+          rm -rf "dist/$out"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/*.tar.gz
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      # Only for CHANGELOG.md, which becomes the release body.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag }}
+          name: ${{ github.event.inputs.tag }}
+          body_path: CHANGELOG.md
+          files: dist/*.tar.gz
