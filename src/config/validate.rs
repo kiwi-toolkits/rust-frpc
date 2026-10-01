@@ -309,6 +309,7 @@ mod tests {
                     ..crate::config::Qos::default()
                 },
                 plugin: None,
+                wire_type: String::new(),
             }],
             ..ClientConfig::default()
         };

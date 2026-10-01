@@ -136,6 +136,27 @@ protocol — a client that answers differently is one those tools cannot manage.
 * **Only the v1 framing is usable.** `v2` framing exists but the `ClientHello`
   exchange is not implemented, so the v2-only `binary-v1` UDP packet codec is out
   of reach as well — `NewUDPPacketReadWriter` rejects a non-empty codec under v1.
+* **A hostname reaches the resolver, not the address parser.** `serverAddr` is a
+  name in almost every real deployment, and the Go client never parses it — it
+  joins `serverAddr` and `serverPort` and hands the result to `net.Dial`. Doing
+  the same here means trying a literal parse first (so a host with no resolver
+  still works) and falling back to `lookup_host`, trying each address it yields,
+  because a name that resolves to several addresses only needs one of them to
+  answer.
+* **`http`, `https` and `tcpmux` are `tcp` on this side.** `frps` owns every
+  routing decision — domains, subdomains, locations, `HTTPUser`, the `tcpmux`
+  muxer — and what reaches the client is an ordinary work connection, which it
+  bridges to `localIP:localPort` exactly as it does for a `tcp` proxy. There is
+  therefore no per-type local code; the registration message is the whole
+  difference, and getting the type string wrong is the only way to get it wrong.
+* **A `tcpmux` `CONNECT` is routed by its authority**, so the request is
+  absolute-form (`CONNECT host:port HTTP/1.1`) and carries no `Host`. The server
+  answers a bare `HTTP/1.1 200 OK` with a `Content-Length` and then hijacks the
+  connection; the tunnel starts after the blank line.
+* **`wireType` changes only what the server is told.** The local side is derived
+  from `type`, so a proxy can be registered as one the server will accept while
+  running as another — which is what `virtual_net` uses it for. A `wireType` this
+  client cannot run is reported and the proxy is skipped rather than registered.
 
 * **A visitor's signature is over the proxy's secret key**, not the auth token:
   `hex(md5(sk ‖ decimal(timestamp)))`. The per-connection crypto is keyed on that
@@ -170,7 +191,8 @@ docs too.
 | `frps` | Not implemented | Out of scope; the Go server is the counterpart. |
 | `useCompression` on work connections | Refused | Not implemented yet. The registration told the server the connection is compressed, so bridging it in the clear would corrupt the stream rather than fail loudly. |
 | `useEncryption`/`useCompression` on a `udp` proxy | Refused | Same reason: the wrapping applies to the packet stream itself and is not wired up, so the work connection is refused rather than bridged unwrapped. |
-| Proxy types | `tcp`, `udp`, `stcp` and `sudp`, so far | The rest of the registration messages already exist in `msg.rs`; the local side of each type is the work. |
+| Proxy types | All but `xtcp`, so far | The rest of the registration messages already exist in `msg.rs`; the local side of each type is the work. |
+| Plugins | None, yet | A config naming one is reported and that proxy is skipped, so the rest of the file still runs. |
 | Visitors | `stcp` and `sudp` | `xtcp` needs NAT hole punching, and a config naming it is skipped with a warning rather than half-run. |
 | Wire protocol | v1 only | The v2 framing is implemented and tested, but the `ClientHello`/`ServerHello` exchange is not, so a `v2` config cannot complete a session. |
 | Admin API | No HTTP framework | Written on `tokio` directly, because the surface is eight routes and a framework costs more binary size than the routing it replaces — which matters for a crate whose point is the size of the process. |

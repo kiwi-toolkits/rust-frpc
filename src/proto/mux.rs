@@ -75,6 +75,9 @@ pub const GO_AWAY_NORMAL: u32 = 0;
 pub struct Config {
     /// How often to ping. `transport.tcpMuxKeepaliveInterval`, default 30s.
     pub keepalive_interval: Duration,
+    /// How long a ping waits for its reply. `ConnectionWriteTimeout` in the Go
+    /// fork, whose default is 10s — deliberately *not* the keepalive interval.
+    pub connection_write_timeout: Duration,
     /// The per-stream receive window ceiling.
     pub max_stream_window: u32,
     /// How long to wait for an `ACK` before giving up on a stream open.
@@ -85,6 +88,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             keepalive_interval: Duration::from_secs(30),
+            connection_write_timeout: Duration::from_secs(10),
             max_stream_window: MAX_STREAM_WINDOW,
             stream_open_timeout: Duration::from_secs(10),
         }
@@ -679,6 +683,10 @@ impl AsyncWrite for Stream {
 /// Reads frames off the socket and dispatches them.
 async fn read_loop(inner: Arc<Inner>, mut socket: tokio::net::tcp::OwnedReadHalf) {
     let mut header = [0u8; HEADER_SIZE];
+    // Subscribed once rather than per frame. `changed()` is level-triggered for
+    // this purpose: before the session dies it never completes, and once it has
+    // died it completes every time it is polled.
+    let mut shutdown_rx = inner.shutdown_tx.subscribe();
     loop {
         if inner.shutdown.load(Ordering::Relaxed) {
             return;
@@ -702,36 +710,48 @@ async fn read_loop(inner: Arc<Inner>, mut socket: tokio::net::tcp::OwnedReadHalf
         let stream_id = u32::from_be_bytes([header[4], header[5], header[6], header[7]]);
         let length = u32::from_be_bytes([header[8], header[9], header[10], header[11]]);
 
-        match frame_type {
-            frame_type::DATA | frame_type::WINDOW_UPDATE => {
-                if let Err(err) =
+        // Everything below can park the reader — the frame queue is bounded, so
+        // `send_frame` waits when the socket is the bottleneck, and a data frame
+        // reads its body off the socket. A session that dies while this is parked
+        // cannot make the read return on its own, so the shutdown has to win the
+        // race from the outside; otherwise the reader is left holding the write
+        // half it will never use again.
+        let step = async {
+            match frame_type {
+                frame_type::DATA | frame_type::WINDOW_UPDATE => {
                     handle_stream_frame(&inner, &mut socket, frame_type, flags, stream_id, length)
                         .await
-                {
+                }
+                frame_type::PING => {
+                    // A SYN is a query that must be echoed; an ACK answers ours.
+                    if flags & flags::SYN != 0 {
+                        inner
+                            .send_frame(frame_type::PING, flags::ACK, 0, length, &[])
+                            .await
+                    } else {
+                        inner.ping_received(length);
+                        Ok(())
+                    }
+                }
+                frame_type::GO_AWAY => {
+                    crate::logging::info("yamux: peer went away");
+                    Err(Error::protocol("yamux: peer went away"))
+                }
+                other => Err(Error::protocol(format!(
+                    "yamux: unknown frame type {other}"
+                ))),
+            }
+        };
+
+        tokio::select! {
+            biased;
+            _ = shutdown_rx.changed() => return,
+            result = step => {
+                if let Err(err) = result {
                     crate::logging::warn(format!("yamux: {err}"));
                     inner.shutdown();
                     return;
                 }
-            }
-            frame_type::PING => {
-                // A SYN is a query that must be echoed; an ACK answers ours.
-                if flags & flags::SYN != 0 {
-                    let _ = inner
-                        .send_frame(frame_type::PING, flags::ACK, 0, length, &[])
-                        .await;
-                } else {
-                    inner.ping_received(length);
-                }
-            }
-            frame_type::GO_AWAY => {
-                crate::logging::info("yamux: peer went away");
-                inner.shutdown();
-                return;
-            }
-            other => {
-                crate::logging::warn(format!("yamux: unknown frame type {other}"));
-                inner.shutdown();
-                return;
             }
         }
     }
@@ -876,8 +896,19 @@ async fn write_loop(
             }
 
             _ = ping_timer.tick() => {
-                // `KeepAliveInterval` doubles as the timeout: the Go fork sends
-                // a ping and tears the session down if it is not answered.
+                // `KeepAliveInterval` decides how often to ping;
+                // `ConnectionWriteTimeout` decides how long to wait for the
+                // reply before treating the peer as gone. Conflating the two
+                // would make the timeout depend on the ping period, which is not
+                // what the Go fork does — and the failure mode is a session that
+                // dies exactly one interval after it comes up.
+                //
+                // The wait happens in a task of its own, and that is not a style
+                // choice. Awaiting the reply here would park this loop, and this
+                // loop is the only thing that ever consumes the outbound queue —
+                // so the ping would sit in the queue unsent and wait for a reply
+                // to something the peer never received. It has to be written
+                // before anything can be waited on.
                 let id = inner.next_ping_id();
                 let sent = inner
                     .send_frame(frame_type::PING, flags::SYN, 0, id, &[])
@@ -886,21 +917,19 @@ async fn write_loop(
                     inner.shutdown();
                     return;
                 }
-                match tokio::time::timeout(
-                    inner.config.keepalive_interval,
-                    inner.wait_for_ping(id),
-                )
-                .await
-                {
-                    Ok(()) => {}
-                    Err(_) => {
+                let waiter = inner.clone();
+                let timeout = inner.config.connection_write_timeout;
+                tokio::spawn(async move {
+                    if tokio::time::timeout(timeout, waiter.wait_for_ping(id))
+                        .await
+                        .is_err()
+                    {
                         crate::logging::warn(format!(
                             "yamux: keepalive ping {id} went unanswered; closing the session"
                         ));
-                        inner.shutdown();
-                        return;
+                        waiter.shutdown();
                     }
-                }
+                });
             }
         }
     }

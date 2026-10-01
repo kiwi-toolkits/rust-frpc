@@ -92,14 +92,17 @@ from a half-parsed file: an unreadable config is logged and ignored.
 * Transports: plain `tcp` today, with or without `tcpMux`. `tls`, `websocket`
   and `kcp` are next. `quic` is deliberately out of scope for now — see the
   roadmap.
-* Proxies: `tcp`, `udp`, `stcp` and `sudp`. The other four types are accepted by
-  the config layer and rejected at registration for now.
+* Proxies: `tcp`, `udp`, `http`, `https`, `tcpmux`, `stcp` and `sudp`. `xtcp` is
+  accepted by the config layer and rejected at registration for now.
 * Visitors: `stcp` and `sudp`, which is how those proxies are reached — nothing is
   published on the server, so the visitor binds a local port (or, for `sudp`, a UDP
   socket) and names the proxy it wants. `xtcp` visitors are skipped with a warning.
   A `sudp` session belongs to the visitor rather than to a user: the first datagram
   opens it, later datagrams from any user ride on it, and each carries the address
   it came from, which is how the answer gets back to the right one.
+* A proxy whose local side this client cannot run — an unimplemented plugin, or a
+  `wireType` it does not speak — is reported and skipped, so one of them does not
+  cost you the other tunnels in the file.
 * Not yet wired up, and each refused rather than half-done: wire protocol `v2`
   (the framing exists in `msg.rs` but the `ClientHello` exchange does not),
   `useCompression` on a work connection, and `useEncryption`/`useCompression` on a

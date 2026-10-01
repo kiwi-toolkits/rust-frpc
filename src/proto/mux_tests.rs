@@ -86,6 +86,46 @@ mod tests {
         );
     }
 
+    /// A session must survive a keepalive cycle.
+    ///
+    /// This is the regression test for a liveness bug that made every session die
+    /// one keepalive interval after it was established: the ping was enqueued and
+    /// then waited on inside the same `select` arm that is the only consumer of the
+    /// outbound queue, so it was never actually written and the reply it was
+    /// waiting for could not arrive. Both ends ping here, so a ping left unsent is
+    /// fatal.
+    ///
+    /// Both timeouts are shortened, and both are needed: the write timeout is what
+    /// makes the broken version fail inside this test's lifetime rather than after
+    /// the default ten seconds.
+    #[tokio::test]
+    async fn a_session_survives_a_keepalive_cycle() {
+        let keepalive = Duration::from_millis(50);
+        let config = Config {
+            keepalive_interval: keepalive,
+            connection_write_timeout: keepalive,
+            ..Config::default()
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+        let client_socket = TcpStream::connect(addr).await.unwrap();
+        let server_socket = accept.await.unwrap();
+        let client = Session::client(client_socket, config);
+        let _server = Session::server(server_socket, config);
+
+        // Several intervals, so a ping that never leaves the queue has had every
+        // chance to tear the session down.
+        tokio::time::sleep(keepalive * 6).await;
+
+        let mut stream = client
+            .open_stream()
+            .await
+            .expect("the session should still be alive after its keepalives");
+        stream.write_all(b"alive").await.unwrap();
+        stream.flush().await.unwrap();
+    }
+
     #[tokio::test]
     async fn client_stream_ids_are_odd_and_increase() {
         let (client, _server) = pair().await;

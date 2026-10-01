@@ -549,6 +549,28 @@ impl ProxyKind {
             _ => (&[], ""),
         }
     }
+
+    /// The domains and subdomain, mutably — the rename-retry strategy rewrites
+    /// `customDomains` alongside the name, and the subdomain with it.
+    pub fn domains_mut(&mut self) -> Option<(&mut Vec<String>, &mut String)> {
+        match self {
+            ProxyKind::Http {
+                custom_domains,
+                subdomain,
+                ..
+            }
+            | ProxyKind::Https {
+                custom_domains,
+                subdomain,
+            }
+            | ProxyKind::Tcpmux {
+                custom_domains,
+                subdomain,
+                ..
+            } => Some((custom_domains, subdomain)),
+            _ => None,
+        }
+    }
 }
 
 /// One `[[proxies]]` entry: identity plus the type-specific body.
@@ -584,6 +606,13 @@ pub struct ProxyConfig {
     pub qos: Qos,
     #[serde(rename = "plugin", skip_serializing_if = "Option::is_none")]
     pub plugin: Option<PluginConfig>,
+    /// `wireType`: registers under this type name instead of `type`.
+    ///
+    /// It changes nothing locally, which is the whole point — `virtual_net` uses
+    /// it to have a `tcp`-shaped proxy registered as one the server will hand
+    /// work connections to without applying its own `tcp` port accounting.
+    #[serde(rename = "wireType", default, skip_serializing_if = "String::is_empty")]
+    pub wire_type: String,
 }
 
 /// Routes each key of a `[[proxies]]` entry to the struct that owns it.
@@ -611,6 +640,7 @@ impl<'de> Deserialize<'de> for ProxyConfig {
         let mut name: Option<String> = None;
         let mut enabled: TriState = None;
         let mut plugin: Option<PluginConfig> = None;
+        let mut wire_type = String::new();
         let mut kind = toml::map::Map::new();
         let mut qos = toml::map::Map::new();
 
@@ -618,6 +648,7 @@ impl<'de> Deserialize<'de> for ProxyConfig {
             match key.as_str() {
                 "name" => name = Some(value.try_into().map_err(D::Error::custom)?),
                 "enabled" => enabled = value.try_into().map_err(D::Error::custom)?,
+                "wireType" => wire_type = value.try_into().map_err(D::Error::custom)?,
                 // A plugin is named either by a bare string (`plugin = "socks5"`)
                 // or by a table whose `type` names it. Its options are only ever
                 // inside that table — the legacy INI form that writes options as
@@ -667,6 +698,7 @@ impl<'de> Deserialize<'de> for ProxyConfig {
             kind,
             qos,
             plugin,
+            wire_type,
         })
     }
 }
@@ -688,6 +720,7 @@ impl ProxyConfig {
             kind,
             qos,
             plugin,
+            wire_type: String::new(),
         }
     }
 
@@ -711,8 +744,56 @@ impl ProxyConfig {
         self.plugin.as_ref()
     }
 
+    /// Whether this proxy has a local side this client can actually run.
+    ///
+    /// False for a plugin that is only parsed, and for a `wireType` that would
+    /// announce a type whose protocol this side does not speak. The startup path
+    /// reports those and carries on with the rest rather than refusing the whole
+    /// config — an unimplemented plugin is not a reason to lose every other
+    /// tunnel in the file.
+    pub fn is_runnable(&self) -> bool {
+        self.wire_type_is_runnable() && !matches!(self.plugin, Some(PluginConfig::Http2Http { .. }))
+    }
+
+    /// Why [`is_runnable`](Self::is_runnable) said no.
+    pub fn unsupported_reason(&self) -> String {
+        if !self.wire_type_is_runnable() {
+            return format!(
+                "wireType {:?} is not a type this client can run",
+                self.wire_type
+            );
+        }
+        match self.plugin.as_ref() {
+            Some(plugin) => format!("plugin {} is not implemented", plugin.type_name()),
+            None => String::new(),
+        }
+    }
+
     pub fn type_name(&self) -> &'static str {
         self.kind.type_name()
+    }
+
+    /// The type name as it is written on the wire.
+    ///
+    /// `wireType` overrides `type` when it is set. The client never derives
+    /// behaviour from it — the local side comes from `type` — but it is what the
+    /// server is told, so a proxy can present itself under a different type on a
+    /// server that would otherwise refuse to be a party to it.
+    pub fn wire_type_name(&self) -> &str {
+        if self.wire_type.is_empty() {
+            self.kind.type_name()
+        } else {
+            &self.wire_type
+        }
+    }
+
+    /// Whether the `wireType` override is one the server runs TCP-shaped.
+    ///
+    /// The override is only honoured when both sides agree it is a plain TCP
+    /// forward in disguise, which is what `virtual_net` uses it for. Anything
+    /// else would announce a type whose protocol this side does not speak.
+    pub fn wire_type_is_runnable(&self) -> bool {
+        self.wire_type.is_empty() || matches!(self.wire_type.as_str(), "tcp" | "udp")
     }
 
     /// Whether this proxy should be started, given the global `start` allowlist.
@@ -757,6 +838,12 @@ pub enum PluginConfig {
         )]
         request_headers: Option<HeaderOperations>,
     },
+    /// A plugin this client can parse but not run.
+    ///
+    /// The alternative is refusing the *whole config* over one unrecognized
+    /// plugin, which would turn a partially-runnable file into a dead one. The
+    /// type stays on the wire — `frps` never sees it, it is purely local — and
+    /// the startup path reports which proxies were skipped.
     #[serde(rename = "http2http")]
     Http2Http {
         #[serde(
@@ -1311,6 +1398,7 @@ mod tests {
                 kind: ProxyKind::Tcp { remote_port: 6000 },
                 qos: Qos::default(),
                 plugin: None,
+                wire_type: String::new(),
             }],
             ..ClientConfig::default()
         };
@@ -1335,6 +1423,7 @@ mod tests {
             kind: ProxyKind::Tcp { remote_port: 1 },
             qos: Qos::default(),
             plugin: None,
+            wire_type: String::new(),
         };
 
         assert!(proxy("a", None).is_enabled(&[]));

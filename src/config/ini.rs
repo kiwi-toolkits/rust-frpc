@@ -416,6 +416,9 @@ fn proxy_from_ini(name: &str, section: &BTreeMap<String, String>) -> Result<Prox
             local_port: get_u16("local_port")?,
         },
         plugin: plugin_from_ini(section),
+        // No legacy INI key ever set this; `wireType` is a TOML-side only key,
+        // exactly as it is on the Go side.
+        wire_type: String::new(),
     })
 }
 

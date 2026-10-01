@@ -19,13 +19,17 @@ use crate::naming;
 
 /// Builds the registration message for `proxy`.
 ///
-/// `name` overrides the proxy's configured name, which is how the rename-retry
-/// strategy substitutes `ex_1_ssh` and friends.
+/// `name` overrides the proxy's configured name. It is what the rename-retry
+/// strategy will pass `ex_1_ssh` through when it is turned on; until then every
+/// caller passes `proxy.name`, and the work-connection lookup in the control loop
+/// matches on that same wire name.
 pub fn to_new_proxy(config: &ClientConfig, proxy: &ProxyConfig, name: &str) -> NewProxy {
     let user = &config.common.user;
     let mut message = NewProxy {
         proxy_name: naming::add_user_prefix(user, name),
-        proxy_type: proxy.type_name().to_string(),
+        // `wireType` when it is set, `type` otherwise. Only the registration is
+        // affected; the local side follows `type`.
+        proxy_type: proxy.wire_type_name().to_string(),
         ..NewProxy::default()
     };
 
@@ -191,6 +195,41 @@ mod tests {
             "ex_1_ssh",
         );
         assert_eq!(message.proxy_name, "alice.ex_1_ssh");
+    }
+
+    /// Registration and the work-connection lookup have to agree on the name.
+    ///
+    /// They are two different pieces of code — one builds `NewProxy`, the other
+    /// matches the `StartWorkConn` the server sends back against the configured
+    /// proxies — and the rename-retry strategy sits between them. As long as the
+    /// strategy is off, every caller must pass the configured name, or a work
+    /// connection arrives for a proxy nobody can find.
+    #[test]
+    fn a_registered_proxy_can_be_found_again_by_its_wire_name() {
+        let config = config_with_user("alice");
+        let p = proxy("ssh", ProxyKind::Tcp { remote_port: 6000 });
+        let message = to_new_proxy(&config, &p, &p.name);
+
+        // The same comparison the control loop makes when a `StartWorkConn`
+        // arrives, and with the same precedence: the proxy's *configured* name,
+        // not a rename override.
+        let found = naming::add_user_prefix(&config.common.user, &p.name) == message.proxy_name;
+        assert!(found, "{} is not findable again", message.proxy_name);
+    }
+
+    #[test]
+    fn a_wire_type_override_is_what_gets_registered() {
+        // `virtual_net` registers a `tcp`-shaped proxy as something else; the
+        // local side is unaffected.
+        let config = config_with_user("");
+        let mut p = proxy("hook", ProxyKind::Tcp { remote_port: 0 });
+        p.wire_type = "virtual_net".into();
+        assert_eq!(p.type_name(), "tcp");
+        assert_eq!(to_new_proxy(&config, &p, "hook").proxy_type, "virtual_net");
+
+        // And with no override the configured type is what goes out.
+        let plain = proxy("ssh", ProxyKind::Tcp { remote_port: 6000 });
+        assert_eq!(to_new_proxy(&config, &plain, "ssh").proxy_type, "tcp");
     }
 
     #[test]

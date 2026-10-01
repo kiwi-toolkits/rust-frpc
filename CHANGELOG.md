@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+* **A stable `tcpMux` session.** The yamux keepalive sent its ping into the
+  outbound queue and then waited for the reply *inside the one loop that drains
+  that queue* — so the ping was never written and the reply it waited for could
+  not arrive. Every session died one keepalive interval after it was established,
+  which on a default 30-second interval is a client that reconnects forever at
+  roughly 40-second intervals. The wait now runs in a task of its own, so the ping
+  reaches the socket before anything is waited on. A regression test
+  (`a_session_survives_a_keepalive_cycle`) fails against the old code.
+* **The read half no longer outlives a dead session.** A frame handler can park on
+  the outbound queue or on a socket read, and a session that died while it was
+  parked could not make it return — leaving the reader holding the socket's write
+  half forever. Shutdown now wins that race.
+* **A hostname `serverAddr` works.** `transport::connect` was parsing the joined
+  `host:port` as a `SocketAddr`, which only accepts a literal address, so every
+  config pointing at a DNS name failed with `invalid socket address syntax` while
+  the identical config worked under the Go client — which hands the string to
+  `net.Dial` and lets the resolver do its job. A literal still takes the
+  no-resolver path.
+* **`http`, `https` and `tcpmux` proxies.** All three are domain-routed by `frps`,
+  so the local side is the ordinary TCP bridge and there was nothing to add to it:
+  what was missing was the registration path being reachable. `frps` hands the
+  client a work connection exactly as it does for `tcp`, and the client joins it
+  to `localIP:localPort`.
+* **`wireType` and a `wireType`-shaped plugin.** A proxy can now register under a
+  different type name than it runs as — which is what `virtual_net` needs — and a
+  proxy whose local side this client cannot run is reported and skipped instead of
+  taking the whole config down with it.
 * **`sudp` proxies and visitors.** The handshake is the `stcp` one over a UDP
   socket, but the session belongs to the *visitor* rather than to a user: the
   first datagram opens it, every later datagram from any user rides on it, and
@@ -101,6 +128,8 @@ Features:
   kept apart, carries an `stcp` round trip through a visitor while refusing a
   visitor with the wrong secret key, carries a `sudp` round trip through a visitor
   and serves two `sudp` users one after the other without mixing their answers up,
+  routes an `http` request by `Host` to a local HTTP service and carries a
+  `tcpmux` `HTTP CONNECT` through to a local TCP service,
   survives a proxy whose local service is down,
   and serves the admin API over real HTTP including `stop` and the credential
   check.
@@ -112,8 +141,9 @@ Features:
   refused rather than bridged unwrapped, since the registration told the server
   otherwise.
 * The TLS, websocket and KCP transports.
-* Proxy types other than `tcp`, `udp`, `stcp` and `sudp`, and the client-side
-  plugins.
+* Proxy types other than `tcp`, `udp`, `http`, `https`, `tcpmux`, `stcp` and
+  `sudp`, and the client-side plugins — a config naming one is reported and that
+  proxy is skipped.
 * The `xtcp` visitor and proxy, which need NAT hole punching.
 * `/api/visitor/{name}/config`, `/api/store/*`, and the static dashboard assets.
 * Wire protocol v2. `msg.rs` encodes and decodes both framings, but the v2

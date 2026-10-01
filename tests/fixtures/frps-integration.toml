@@ -18,3 +18,18 @@ transport.tcpMux = true
 # Explicit rather than inherited from bindAddr, so the port a proxy is published
 # on is never in doubt.
 proxyBindAddr = "127.0.0.1"
+
+# The `http` round-trip test routes by host, and `frps` will not accept an
+# arbitrary `Host` unless the domain is one it was told to serve — either in
+# `vhostHTTPPort`'s own list or, as here, in `subDomainHost`, which makes
+# `<anything>.<subDomainHost>` resolvable.
+subDomainHost = "rust-frpc.test"
+
+# The vhost port an `http` proxy is published through, and the port every
+# `tcpmux` proxy is reached on with an `HTTP CONNECT`.
+#
+# Deliberately above the range tests/memory.rs generates its hundred proxies
+# from (`FIRST_REMOTE_PORT` onwards), because that test and this fixture are
+# never run against the same frps but are run on the same machine.
+vhostHTTPPort = 17510
+tcpmuxHTTPConnectPort = 17511

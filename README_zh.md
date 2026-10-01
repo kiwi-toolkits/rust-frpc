@@ -82,11 +82,14 @@ curl localhost:7400/metrics  # 纯文本计数器
 * 线协议为 **v1**（默认值，也是旧版服务端唯一认识的取值），`transport.tcpMux` 开或关都支持。
 * 传输方式：当前为纯 `tcp`，`tcpMux` 开或关都支持；`tls`、`websocket`、`kcp` 下一步支持。
   `quic` 暂不在范围内，见路线图。
-* 代理类型：目前支持 `tcp`、`udp`、`stcp` 与 `sudp`。其余四种在配置层可解析，注册时会明确拒绝。
+* 代理类型：目前支持 `tcp`、`udp`、`http`、`https`、`tcpmux`、`stcp` 与 `sudp`。
+  `xtcp` 在配置层可解析，注册时会明确拒绝。
 * visitor：支持 `stcp` 与 `sudp`——这两类代理不在服务端暴露任何端口，因此需要 visitor 在本地
   绑定一个端口（`sudp` 为 UDP）并指名它要访问的代理。`xtcp` visitor 会记录警告并跳过。
   `sudp` 的会话属于 visitor 而非某个用户：第一个数据报开启会话，之后任意用户的数据报都走同一条
   会话，每条都带着自己的来源地址——回答正是靠它回到正确的人手上。
+* 本地侧跑不了的代理（插件未实现、或 `wireType` 不是本客户端支持的类型）会被记录并跳过，
+  不会因为其中一个而让配置文件里的其它隧道一起失效。
 * 以下能力尚未接通，且都是**明确拒绝而非半成品**：线协议 `v2`（`msg.rs` 里有分帧实现，
   但 `ClientHello` 交换未实现）、工作连接的 `useCompression`、以及 `udp` 代理上的
   `useEncryption`/`useCompression`。

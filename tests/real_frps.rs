@@ -50,6 +50,13 @@ const VISITOR_PORT_UDP: u16 = 17_221;
 const STCP_SECRET: &str = "rust-frpc-stcp-secret";
 /// The admin API port the client is asked to listen on.
 const ADMIN_PORT: u16 = 17_300;
+/// The vhost port the `http` round-trip test asks `frps` to open.
+const VHOST_PORT: u16 = 17_510;
+/// The `HTTP CONNECT` port `frps` serves every `tcpmux` proxy on.
+const MUX_PORT: u16 = 17_511;
+/// Must match `subDomainHost` in tests/fixtures/frps-integration.toml, because a
+/// subdomain is only served as `<subdomain>.<subDomainHost>`.
+const SUBDOMAIN_HOST: &str = "rust-frpc.test";
 const TOKEN: &str = "rust-frpc-integration";
 
 fn frps() -> Option<(String, String)> {
@@ -177,6 +184,62 @@ fn client_config_with_sudp_visitor(server_name: &str, bind_port: u16) -> config:
     config
 }
 
+/// An `http` proxy whose local service is a small HTTP responder.
+///
+/// The client's part in an `http` proxy is bytes to `localIP:localPort`, so the
+/// local side has to speak HTTP for the round trip to mean anything.
+fn client_config_with_http_proxy(local_port: u16, subdomain: &str) -> config::ClientConfig {
+    let mut config = client_config();
+    config.proxies.push(ProxyConfig::new(
+        "web",
+        None,
+        ProxyKind::Http {
+            custom_domains: Vec::new(),
+            subdomain: subdomain.into(),
+            locations: vec!["/".into()],
+            http_user: String::new(),
+            http_password: String::new(),
+            host_header_rewrite: String::new(),
+            request_headers: None,
+            response_headers: None,
+            route_by_http_user: String::new(),
+        },
+        Qos {
+            local_ip: "127.0.0.1".into(),
+            local_port,
+            ..Qos::default()
+        },
+        None,
+    ));
+    config.complete();
+    config
+}
+
+/// A `tcpmux` proxy over `HTTP CONNECT`.
+fn client_config_with_tcpmux_proxy(local_port: u16, domain: &str) -> config::ClientConfig {
+    let mut config = client_config();
+    config.proxies.push(ProxyConfig::new(
+        "mux",
+        None,
+        ProxyKind::Tcpmux {
+            custom_domains: vec![domain.into()],
+            subdomain: String::new(),
+            http_user: String::new(),
+            http_password: String::new(),
+            route_by_http_user: String::new(),
+            multiplexer: "httpconnect".into(),
+        },
+        Qos {
+            local_ip: "127.0.0.1".into(),
+            local_port,
+            ..Qos::default()
+        },
+        None,
+    ));
+    config.complete();
+    config
+}
+
 /// A `udp` proxy whose datagrams go to a local UDP service.
 fn client_config_with_udp_proxy(remote_port: u16, local_port: u16) -> config::ClientConfig {
     let mut config = client_config();
@@ -285,6 +348,92 @@ async fn start_echo() -> u16 {
         }
     });
     port
+}
+
+/// Starts a minimal local HTTP service, returning its port.
+///
+/// It answers any request with `http-ok:<path>`, so the assertion can read the
+/// path the request actually carried — which is what shows the server forwarded
+/// the user's own request rather than a fixed probe.
+async fn start_http_echo() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                let Ok(read) = socket.read(&mut buf).await else {
+                    return;
+                };
+                let request = String::from_utf8_lossy(&buf[..read]).to_string();
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("/")
+                    .to_string();
+                let body = format!("http-ok:{path}");
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.flush().await;
+            });
+        }
+    });
+    port
+}
+
+/// Requests `path` until the server routes it to the proxy instead of answering
+/// its own 404 page.
+///
+/// `frps`'s vhost listener is up from startup, so a connect says nothing about
+/// whether a proxy has been registered on it; only the response does.
+async fn http_get_until_ok(host: String, path: &str) -> String {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match http_get(host.clone(), path).await {
+            Ok(body) => return body,
+            Err(status) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "frps never routed {host} to the proxy: {status}"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+}
+
+/// Makes one HTTP/1.1 request through `frps`'s vhost port, addressed by `Host`.
+///
+/// `Err` carries the status line when the server answered with its own page
+/// rather than forwarding to the proxy.
+async fn http_get(host: String, path: &str) -> std::result::Result<String, String> {
+    let mut stream = TcpStream::connect(("127.0.0.1", VHOST_PORT)).await.unwrap();
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).await.unwrap();
+    stream.flush().await.unwrap();
+
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut response))
+        .await
+        .expect("frps should answer the http request within ten seconds")
+        .expect("read the http response");
+
+    let response = String::from_utf8_lossy(&response).to_string();
+    let (head, body) = response
+        .split_once("\r\n\r\n")
+        .expect("an HTTP response has a header block");
+    if head.starts_with("HTTP/1.1 200") {
+        Ok(body.to_string())
+    } else {
+        Err(head.lines().next().unwrap_or_default().to_string())
+    }
 }
 
 /// Waits until `frps` has published the proxy on `port`.
@@ -474,6 +623,147 @@ async fn real_frps_answers_a_ping() {
 
     session.close().await.ok();
     let _ = frps.kill().await;
+}
+
+/// An `http` proxy: a request to `frps`'s vhost port, routed by `Host`, is
+/// forwarded to the local HTTP service.
+///
+/// The client's whole part in an `http` proxy is bytes to `localIP:localPort` —
+/// domains, subdomains and locations are all the server's business. What this
+/// proves is that it registers the right type and then bridges what it is handed,
+/// which is the part that can be wrong on this side.
+#[tokio::test]
+#[ignore = "needs a real frps: set RUN_REAL_FRPS_TESTS=1, FRPS_BIN and FRPS_CONFIG"]
+async fn real_frps_routes_an_http_request_by_host() {
+    let Some((bin, config_path)) = frps() else {
+        return;
+    };
+    let mut frps = start(&bin, &config_path);
+    wait_for_port(CONTROL_PORT, Duration::from_secs(10)).await;
+
+    let web_port = start_http_echo().await;
+    let client = spawn_client(client_config_with_http_proxy(web_port, "web"));
+    wait_for_port(VHOST_PORT, Duration::from_secs(10)).await;
+
+    // `frps`'s vhost listener comes up at startup, so the connect above only
+    // proves the server is listening. What proves the *proxy* is routed is a
+    // request that reaches the local service rather than the 404 page, so this
+    // retries until it does.
+    let host = format!("web.{SUBDOMAIN_HOST}");
+    let body = http_get_until_ok(host.clone(), "/").await;
+    assert_eq!(body, "http-ok:/");
+
+    // The path is matched by the server and forwarded, so a second request proves
+    // the bytes that came out are the ones the user sent rather than a fixed probe.
+    let body = http_get(host, "/status")
+        .await
+        .expect("the proxy should still be routed");
+    assert_eq!(body, "http-ok:/status");
+
+    client.stop().await;
+    let _ = frps.kill().await;
+}
+
+/// A `tcpmux` proxy: `frps` speaks `HTTP CONNECT` on its multiplexer port and the
+/// tunnel that comes out is a plain byte pipe.
+///
+/// A `CONNECT` names the target in the request line and carries no `Host`, so
+/// `frps` routes it by the authority — which is why the request is absolute-form.
+/// The acknowledgement is `HTTP/1.1 200 OK` followed by at least a
+/// `Content-Length: 0`; the tunnel starts after the blank line.
+#[tokio::test]
+#[ignore = "needs a real frps: set RUN_REAL_FRPS_TESTS=1, FRPS_BIN and FRPS_CONFIG"]
+async fn real_frps_carries_a_tcpmux_connect() {
+    let Some((bin, config_path)) = frps() else {
+        return;
+    };
+    let mut frps = start(&bin, &config_path);
+    wait_for_port(CONTROL_PORT, Duration::from_secs(10)).await;
+
+    let echo_port = start_echo().await;
+    let client = spawn_client(client_config_with_tcpmux_proxy(echo_port, "mux"));
+
+    // The muxer port is listening from the moment `frps` starts — it is one
+    // listener shared by every `tcpmux` proxy — so a successful connect says
+    // nothing about registration. An unregistered authority gets a 404, so the
+    // response is what this loop waits on.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut stream = loop {
+        match connect_muxer("mux").await {
+            Ok(stream) => break stream,
+            Err(response) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the muxer never accepted a CONNECT for mux: {response:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    };
+
+    // Past the CONNECT response it is the ordinary TCP bridge to the local
+    // service, which is the only part of a `tcpmux` proxy this client owns.
+    stream.write_all(b"through the muxer").await.unwrap();
+    stream.flush().await.unwrap();
+    let mut got = [0u8; 17];
+    tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut got))
+        .await
+        .expect("the echoed bytes should come back within ten seconds")
+        .expect("read the echo");
+    assert_eq!(&got, b"through the muxer");
+
+    client.stop().await;
+    let _ = frps.kill().await;
+}
+
+/// Sends `CONNECT <domain>:<port>` to `frps`'s multiplexer port and reads back
+/// its response headers.
+///
+/// The response is read up to the blank line rather than a fixed number of bytes:
+/// the muxer writes its own status line and at least a `Content-Length`, and
+/// counting bytes would bake in one server's exact framing. Whatever comes after
+/// the blank line is the tunnel.
+///
+/// `Ok` carries the stream once the status was 200; `Err` carries the status line
+/// otherwise, which for an unregistered authority is a 404.
+async fn connect_muxer(domain: &str) -> std::result::Result<TcpStream, String> {
+    let mut stream = TcpStream::connect(("127.0.0.1", MUX_PORT))
+        .await
+        .map_err(|e| e.to_string())?;
+    // Absolute-form with an explicit port: both are what a real proxy client
+    // sends, and `frps` matches the authority against the domain it registered.
+    let request = format!("CONNECT {domain}:{MUX_PORT} HTTP/1.1\r\n\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .map_err(|e| e.to_string())?;
+    stream.flush().await.map_err(|e| e.to_string())?;
+
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut byte))
+            .await
+            .map_err(|_| "no response to CONNECT".to_string())?
+            .map_err(|e| e.to_string())?;
+        if read == 0 {
+            return Err("the muxer closed without a response".to_string());
+        }
+        head.push(byte[0]);
+        if head.ends_with(b"\r\n\r\n") {
+            break;
+        }
+        if head.len() > 4096 {
+            return Err("the CONNECT response headers do not end".to_string());
+        }
+    }
+
+    let head = String::from_utf8_lossy(&head).to_string();
+    if head.starts_with("HTTP/1.1 200") {
+        Ok(stream)
+    } else {
+        Err(head.lines().next().unwrap_or_default().to_string())
+    }
 }
 
 /// The same login over the non-multiplexed transport, so a regression in either

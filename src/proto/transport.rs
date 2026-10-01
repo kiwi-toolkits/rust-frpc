@@ -58,23 +58,33 @@ pub async fn connect(
             Error::config(format!("invalid transport.connectServerLocalIP: {err}"))
         })?)
     };
-    let remote: SocketAddr = target
-        .parse()
-        .map_err(|err| Error::config(format!("invalid server address {target}: {err}")))?;
 
     let future = async {
-        match local {
-            None => TcpStream::connect(remote).await,
-            Some(local) => {
-                let socket = if remote.is_ipv6() {
-                    tokio::net::TcpSocket::new_v6()?
-                } else {
-                    tokio::net::TcpSocket::new_v4()?
-                };
-                socket.bind(local)?;
-                socket.connect(remote).await
+        // A name is the common case: `frpc` is normally pointed at a DNS name and
+        // the port is joined on here, exactly as `net.JoinHostPort` does it. A
+        // literal address skips the resolver, which is both faster and the path
+        // that works on a host with no resolver configured at all.
+        if let Ok(remote) = target.parse::<SocketAddr>() {
+            return dial_addr(remote, local).await;
+        }
+        let mut last = None;
+        for remote in tokio::net::lookup_host(&target)
+            .await
+            .map_err(|err| std::io::Error::other(format!("cannot resolve {target}: {err}")))?
+        {
+            match dial_addr(remote, local).await {
+                Ok(stream) => return Ok(stream),
+                // A name can resolve to several addresses and only one of them
+                // has to answer — that is precisely what `lookup_host` is for.
+                Err(err) => last = Some(err),
             }
         }
+        Err(last.unwrap_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::AddrNotAvailable,
+                format!("{target} resolved to no addresses"),
+            )
+        }))
     };
 
     let stream = tokio::time::timeout(timeout, future)
@@ -94,6 +104,25 @@ pub async fn connect(
     }
 
     Ok(stream)
+}
+
+/// One dial, to an address already resolved.
+///
+/// Binding a source address only makes sense once the family is known, which is
+/// why this is separate from the resolution above.
+async fn dial_addr(remote: SocketAddr, local: Option<SocketAddr>) -> std::io::Result<TcpStream> {
+    match local {
+        None => TcpStream::connect(remote).await,
+        Some(local) => {
+            let socket = if remote.is_ipv6() {
+                tokio::net::TcpSocket::new_v6()?
+            } else {
+                tokio::net::TcpSocket::new_v4()?
+            };
+            socket.bind(local)?;
+            socket.connect(remote).await
+        }
+    }
 }
 
 /// Adds a port when the address has none, so `"1.2.3.4"` becomes
@@ -194,5 +223,41 @@ mod tests {
 
         transport.protocol = "kcp".into();
         assert!(Transport::from_config(&transport).is_err());
+    }
+
+    /// A name has to reach the resolver, not the address parser.
+    ///
+    /// This is the bug that made `serverAddr = "host.example.com"` fail with
+    /// "invalid socket address syntax" while the identical config worked under
+    /// the Go client: `"host.example.com:7000"` does not parse as a `SocketAddr`,
+    /// and Go never asks it to — it hands the joined string to `net.Dial`.
+    #[tokio::test]
+    async fn a_name_is_resolved_rather_than_parsed_as_an_address() {
+        // Nothing is listening, so this cannot succeed. What it proves is the
+        // shape of the failure: a resolved-and-refused dial, not a config error.
+        let err = connect("localhost:1", Duration::from_secs(5), "", None)
+            .await
+            .unwrap_err();
+        assert!(
+            !matches!(err, Error::Config(_)),
+            "a hostname must be resolved, not rejected as a bad address: {err}"
+        );
+    }
+
+    /// An address literal still has to work, and has to skip the resolver.
+    ///
+    /// `127.0.0.1` is a name to `lookup_host` but a literal to `parse`, and the
+    /// literal path is what keeps a host with no resolver configured working.
+    #[tokio::test]
+    async fn a_literal_address_still_dials() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = tokio::spawn(async move { listener.accept().await.map(|_| ()) });
+
+        let stream = connect(&addr.to_string(), Duration::from_secs(5), "", None)
+            .await
+            .unwrap();
+        assert!(stream.peer_addr().unwrap().port() == addr.port());
+        accepted.await.unwrap().unwrap();
     }
 }

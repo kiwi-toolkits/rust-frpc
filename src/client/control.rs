@@ -255,6 +255,22 @@ impl Control {
             .proxies
             .iter()
             .filter(|proxy| proxy.is_enabled(&config.common.start))
+            .filter(|proxy| {
+                // A proxy whose local side this client cannot run is reported and
+                // left out, rather than taking the whole config down with it. One
+                // unimplemented plugin should not cost an operator every other
+                // tunnel in the file — and `--check-config` stays the way to find
+                // out about it before deploying.
+                let runnable = proxy.is_runnable();
+                if !runnable {
+                    logging::warn(format!(
+                        "proxy {} is skipped: {}",
+                        proxy.name,
+                        proxy.unsupported_reason()
+                    ));
+                }
+                runnable
+            })
             .cloned()
             .collect();
 
@@ -756,9 +772,13 @@ async fn open_work_conn(
     }
 
     let name = naming::strip_user_prefix(user, &start.proxy_name);
-    let Some(proxy) = proxies.iter().find(|proxy| proxy.name == name) else {
+    let Some(proxy) = proxies
+        .iter()
+        .find(|proxy| naming::add_user_prefix(user, &proxy.name) == start.proxy_name)
+    else {
         logging::warn(format!(
-            "the server sent a connection for unknown proxy {name}"
+            "the server sent a connection for unknown proxy {}",
+            start.proxy_name
         ));
         return Ok(());
     };

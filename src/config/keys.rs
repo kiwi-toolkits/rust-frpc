@@ -103,7 +103,7 @@ pub const QUIC_KEYS: &[&str] = &["keepalivePeriod", "maxIdleTimeout", "maxIncomi
 pub const STORE_KEYS: &[&str] = &["path"];
 
 /// `[[proxies]]` keys that are not type-specific.
-pub const PROXY_BASE_KEYS: &[&str] = &["name", "enabled", "type", "plugin"];
+pub const PROXY_BASE_KEYS: &[&str] = &["name", "enabled", "type", "plugin", "wireType"];
 
 /// The per-proxy keys shared by every type.
 pub const QOS_KEYS: &[&str] = &[
