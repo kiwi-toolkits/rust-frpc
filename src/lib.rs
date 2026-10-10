@@ -145,22 +145,33 @@ fn run_client(args: &cli::Args) -> ExitCode {
     };
 
     let config = loaded.config;
+    // `log.level` in the file, overridden by `--log-level`. `log.InitLogger`
+    // takes the first and the flag layer takes the second, on the Go side.
     let level = args
         .log_level
         .clone()
         .or_else(|| config.common.log.as_ref().map(|log| log.level.clone()))
         .and_then(|level| logging::Level::parse(&level))
         .unwrap_or(logging::Level::Info);
-    let format = match config
-        .common
-        .log
-        .as_ref()
-        .and_then(|log| log.format.as_deref())
-    {
+    let file_log = config.common.log.clone().unwrap_or_default();
+    // `log.format` is this crate's addition; text is the frp-compatible default.
+    let format = match file_log.format.as_deref() {
         Some("json") => logging::Format::Json,
         _ => logging::Format::Text,
     };
-    logging::init(level, format);
+    let log_config = logging::Config {
+        level,
+        format,
+        to: file_log.to.clone(),
+        max_days: file_log.max_days,
+        disable_print_color: file_log.disable_print_color,
+    };
+    if let Err(err) = logging::init(log_config) {
+        // Reported on stderr rather than through the logger, which is the thing
+        // that just failed. Not fatal: a missing log directory should not stop
+        // the tunnel, and the records still have somewhere to go.
+        eprintln!("error: {err}");
+    }
 
     for warning in &loaded.warnings {
         logging::warn(warning);

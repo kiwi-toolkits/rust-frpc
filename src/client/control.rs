@@ -329,15 +329,18 @@ impl Control {
         mut restart: tokio::sync::watch::Receiver<bool>,
         events: Option<mpsc::Sender<ControlEvent>>,
     ) -> Result<()> {
-        logging::info(format!(
-            "start {} proxy(s): {}",
-            self.proxies.len(),
-            self.proxies
-                .iter()
-                .map(|proxy| proxy.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
+        logging::log_at(
+            logging::Level::Info,
+            logging::callers::PROXY_ADDED,
+            format!(
+                "proxy added: {}",
+                self.proxies
+                    .iter()
+                    .map(|proxy| proxy.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        );
 
         for index in 0..self.proxies.len() {
             if let Err(err) = self.announce(index).await {
@@ -613,17 +616,26 @@ impl Control {
             logging::warn(format!("the server answered for unknown proxy {name}"));
             return;
         };
+        let log = logging::Prefixed::new(&name);
 
         if resp.error.is_empty() {
-            logging::info(format!(
-                "proxy {name} is running, remote address: {}",
-                resp.remote_addr
-            ));
+            // The remote address is this client's addition: frp's own line is
+            // just the success, and the address is what an operator has to run
+            // `frpc status` to find.
+            log.at(
+                logging::Level::Info,
+                logging::callers::PROXY_START,
+                format!("start proxy success, remote address: {}", resp.remote_addr),
+            );
             status.phase = ProxyPhase::Running;
             status.remote_addr = resp.remote_addr;
             status.error.clear();
         } else {
-            logging::warn(format!("proxy {name} failed to start: {}", resp.error));
+            log.at(
+                logging::Level::Warn,
+                logging::callers::PROXY_START_ERROR,
+                format!("start error: {}", resp.error),
+            );
             status.phase = ProxyPhase::StartError;
             status.error = resp.error;
         }

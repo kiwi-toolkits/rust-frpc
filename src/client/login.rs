@@ -59,12 +59,6 @@ pub async fn connect(config: &ClientConfig) -> Result<(Codec, Connector)> {
     let codec = Codec::new(WireProtocol::parse(&transport_cfg.wire_protocol));
 
     let addr = transport::join_host_port(&common.server_addr, common.server_port);
-    logging::info(format!(
-        "start frpc, server: {addr}, protocol: {}, wire: {}, tcpMux: {}",
-        transport_cfg.protocol,
-        codec.protocol().as_str(),
-        transport_cfg.tcp_mux.unwrap_or(true),
-    ));
 
     let dial_timeout = Duration::from_secs(transport_cfg.dial_server_timeout.max(1) as u64);
     // A negative `dialServerKeepalive` means "no probes".
@@ -125,10 +119,11 @@ pub async fn login_over(
         return Err(Error::Login(resp.error));
     }
 
-    logging::info(format!(
-        "login to server success, server version: {}, run id: {}",
-        resp.version, resp.run_id
-    ));
+    logging::Prefixed::new(&resp.run_id).at(
+        logging::Level::Info,
+        logging::callers::LOGIN_SUCCESS,
+        format!("login to server success, get run id [{}]", resp.run_id),
+    );
 
     // Everything after the login is encrypted, which is unconditional — not
     // something `useEncryption` turns on.

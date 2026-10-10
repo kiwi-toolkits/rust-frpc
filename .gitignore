@@ -1,3 +1,7 @@
 /target
 /dist
 **/*.rs.bk
+
+# Local toolchain (zig, cargo-zigbuild) kept beside the project, as
+# scripts/build-arm.* expects. It is a per-machine download, never committed.
+/.tools

@@ -19,24 +19,26 @@ use tokio::sync::{mpsc, watch};
 use crate::config::{ClientConfig, ProxyConfig};
 use crate::error::{Error, Result};
 use crate::logging;
-use crate::util::backoff::Backoff;
+use crate::util::backoff::{Backoff, FastBackoffOptions};
 
 use super::admin::{self, AdminCommand, AdminServer};
 use super::control::{Control, ControlEvent, StatusSnapshot, Traffic};
 use super::login;
 use super::session::Session;
 
-/// How long to wait before the very first login attempt is repeated.
+/// How long the *first* login's backoff is capped at.
 ///
-/// The Go client retries the initial login every 10 seconds
-/// (`client/service.go`), and unlike the reconnect path it does not give up.
-pub const FIRST_LOGIN_RETRY: Duration = Duration::from_secs(10);
+/// `client/service.go:262` passes 10 seconds to `loopLoginUntilSuccess`, and that
+/// value becomes the `MaxDuration` of that path's manager. It only ever bites
+/// when `loginFailExit` is off: the default is to give up on the first failure,
+/// which is a configuration mistake rather than a blip.
+pub const FIRST_LOGIN_MAX_INTERVAL: Duration = Duration::from_secs(10);
 
-/// How long a session has to survive before the backoff is considered fresh.
+/// How long the reconnect backoff is capped at.
 ///
-/// Without this, a server that accepts a login and then immediately drops the
-/// connection would be reconnected to at the fast-retry rate forever.
-const HEALTHY_SESSION: Duration = Duration::from_secs(30);
+/// `keepControllerWorking` passes 20 seconds the same way
+/// (`client/service.go:287` → `:299`).
+pub const RECONNECT_MAX_INTERVAL: Duration = Duration::from_secs(20);
 
 /// Runs the client until `shutdown` fires.
 ///
@@ -208,8 +210,31 @@ async fn serve(
     } = sides;
     let login_fail_exit = config.common.login_fail_exit.unwrap_or(true);
 
-    // The first login: retried on a fixed interval, because nothing is running
-    // yet and there is no session to preserve.
+    // `startServiceWithAggregator` logs this once, before the first attempt, and
+    // again on the way out. It is the line an operator greps to find which file a
+    // running client was started from — so it is the config file's path, not the
+    // server address.
+    if let Some(path) = config_path
+        .as_ref()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        logging::log_at(
+            logging::Level::Info,
+            logging::callers::START,
+            format!(
+                "start frpc service for config file [{}] with aggregated configuration",
+                path.display()
+            ),
+        );
+    }
+
+    // The first login. `loopLoginUntilSuccess(10*time.Second, loginFailExit)`:
+    // the same backoff curve as a reconnect, capped ten seconds out, and it only
+    // keeps going when `loginFailExit` is off.
+    let mut first_login_backoff = Backoff::new(FastBackoffOptions {
+        max_duration: FIRST_LOGIN_MAX_INTERVAL,
+        ..FastBackoffOptions::default()
+    });
     let session = loop {
         if *stop_rx.borrow() {
             return Ok(());
@@ -224,18 +249,26 @@ async fn serve(
                     logging::error(format!("login failed, exiting: {err}"));
                     return Err(err);
                 }
+                let delay = first_login_backoff.next(true);
                 logging::warn(format!(
-                    "login failed ({err}), retrying in {FIRST_LOGIN_RETRY:?}"
+                    "login to the server failed ({err}), retrying in {delay:?}"
                 ));
-                tokio::select! {
-                    _ = tokio::time::sleep(FIRST_LOGIN_RETRY) => {}
-                    _ = stop_rx.changed() => return Ok(()),
+                if !sleep_or_shutdown(delay, &mut stop_rx).await {
+                    return Ok(());
                 }
             }
         }
     };
 
-    let mut backoff = Backoff::default();
+    // Two managers, mirroring Go's two `BackoffUntil` calls. `backoff` covers the
+    // gap after an established session dies and lives as long as the client does;
+    // each login phase gets a fresh inner one inside `login_again`, because Go
+    // builds that manager inside `loopLoginUntilSuccess` and throws it away when
+    // the login finally succeeds.
+    let mut backoff = Backoff::new(FastBackoffOptions {
+        max_duration: RECONNECT_MAX_INTERVAL,
+        ..FastBackoffOptions::default()
+    });
     let mut run_id = session.run_id().to_string();
     let mut pending: Option<Session> = Some(session);
 
@@ -260,7 +293,6 @@ async fn serve(
         // graceful exit — the `CloseProxy` messages — still happens.
         let mut intent: Option<SessionEnd> = None;
         let mut commands_open = commands_live;
-        let started = std::time::Instant::now();
         let session_future = control.run(stop_rx.clone(), restart_rx.clone(), events.clone());
         tokio::pin!(session_future);
 
@@ -313,14 +345,7 @@ async fn serve(
                 // Cleared before the next session starts, or it would see the
                 // flag still set and stop again immediately.
                 let _ = restart_tx.send(false);
-                login_again(
-                    &config,
-                    &mut run_id,
-                    &mut pending,
-                    &mut backoff,
-                    &mut stop_rx,
-                )
-                .await?;
+                login_again(&config, &mut run_id, &mut pending, &mut stop_rx).await?;
                 continue;
             }
             SessionEnd::Failed(error) => {
@@ -329,25 +354,19 @@ async fn serve(
                     return Err(error);
                 }
 
-                let healthy = started.elapsed() > HEALTHY_SESSION;
-                if healthy {
-                    backoff.reset();
-                }
-                let delay = backoff.next(!healthy);
+                // The delay for the *next* login phase. Go's `BackoffUntil` calls
+                // its manager once before the attempt and again after it — the
+                // second call is what the ticker is reset to — so the gap after a
+                // dead session comes from the outer manager and the gaps while
+                // `login_again` keeps failing come from the inner one.
+                let delay = backoff.next(true);
                 logging::warn(format!(
                     "control session ended ({error}), reconnecting in {delay:?}"
                 ));
                 if !sleep_or_shutdown(delay, &mut stop_rx).await {
                     return Ok(());
                 }
-                login_again(
-                    &config,
-                    &mut run_id,
-                    &mut pending,
-                    &mut backoff,
-                    &mut stop_rx,
-                )
-                .await?;
+                login_again(&config, &mut run_id, &mut pending, &mut stop_rx).await?;
             }
         }
     }
@@ -357,13 +376,24 @@ async fn serve(
 ///
 /// A failed attempt keeps the old run id: the server never saw the new session,
 /// so the id it knows is still the useful one.
+///
+/// The backoff here is Go's *inner* one, from `loopLoginUntilSuccess`
+/// (`client/service.go:360-366`), and it is deliberately created fresh for each
+/// login phase. It carries no fast retries — that layer belongs to the outer
+/// manager, which is what produced the delay that got us here — so the curve is
+/// a plain `1s → ×2 → 20s`, jittered by 10%. That is exactly the sequence the
+/// error `Connection refused` produces against a restarted `frps`, and it is why
+/// an outage settles on one attempt every 20 seconds.
 async fn login_again(
     config: &ClientConfig,
     run_id: &mut String,
     pending: &mut Option<Session>,
-    backoff: &mut Backoff,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<()> {
+    let mut backoff = Backoff::new(FastBackoffOptions {
+        max_duration: RECONNECT_MAX_INTERVAL,
+        ..FastBackoffOptions::default()
+    });
     loop {
         match login(config, run_id).await {
             Ok(reconnected) => {
@@ -378,8 +408,8 @@ async fn login_again(
                 if !super::control::should_reconnect(&err) {
                     return Err(err);
                 }
-                logging::warn(format!("reconnect failed: {err}"));
                 let delay = backoff.next(true);
+                logging::warn(format!("reconnect failed: {err}, retrying in {delay:?}"));
                 if !sleep_or_shutdown(delay, shutdown).await {
                     return Ok(());
                 }
@@ -478,8 +508,45 @@ mod tests {
     }
 
     #[test]
-    fn the_first_login_retry_interval_matches_the_go_client() {
-        assert_eq!(FIRST_LOGIN_RETRY, Duration::from_secs(10));
+    fn the_backoff_ceilings_match_the_go_client() {
+        // `loopLoginUntilSuccess(10s, ...)` for the first login and
+        // `loopLoginUntilSuccess(20s, ...)` for a reconnect.
+        assert_eq!(FIRST_LOGIN_MAX_INTERVAL, Duration::from_secs(10));
+        assert_eq!(RECONNECT_MAX_INTERVAL, Duration::from_secs(20));
+    }
+
+    /// The shape of an outage: `1s → ×2 → 20s`, no fast retries.
+    ///
+    /// This is Go's inner manager from `loopLoginUntilSuccess`, which is the one
+    /// that runs for as long as `frps` is refusing connections. The outer
+    /// manager's fast-retry burst happens once, when the session first dies, and
+    /// is deliberately absent here — a version of this code that reused one
+    /// manager for both is what made the delays come out wrong.
+    #[test]
+    fn a_failing_login_phase_climbs_to_the_ceiling_without_fast_retries() {
+        let mut backoff = Backoff::new(FastBackoffOptions {
+            max_duration: RECONNECT_MAX_INTERVAL,
+            ..FastBackoffOptions::default()
+        });
+        // Jitter is `duration + rand * 0.1 * duration`, so each delay lands in
+        // `[base, base * 1.1]`.
+        let expected = [
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            Duration::from_secs(4),
+            Duration::from_secs(8),
+            Duration::from_secs(16),
+            Duration::from_secs(20),
+            Duration::from_secs(20),
+        ];
+        for (index, base) in expected.into_iter().enumerate() {
+            let delay = backoff.next(true);
+            let slack = base / 10;
+            assert!(
+                delay >= base && delay <= base + slack,
+                "delay {index} = {delay:?}, expected {base:?} plus at most 10%",
+            );
+        }
     }
 
     #[test]

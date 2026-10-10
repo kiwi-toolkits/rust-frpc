@@ -20,7 +20,21 @@ multiplexer are all pure Rust — so there is no build script to satisfy and no
 projects that link OpenSSL or aws-lc, and it makes these builds quick.
 
 If `zig` and `cargo-zigbuild` live in the repository's `.tools/` directory (a
-common local setup), the build scripts put them on `PATH` themselves.
+common local setup), the build scripts put them on `PATH` themselves. That is
+the only thing those four lines in the script do — they are not a fallback to a
+system install, so `zig is required and must be on PATH` means exactly what it
+says: the script looked in `.tools/zig` and did not find a `zig.exe` there.
+
+`.tools/` is in `.gitignore`, so it is a per-machine download rather than
+something a fresh clone has. On Windows the quickest way to point it at a zig
+that is already on the machine is a directory junction:
+
+```powershell
+New-Item -ItemType Junction -Path .tools\zig -Target D:\path\to\zig
+```
+
+A junction needs no administrator rights, unlike a symbolic link, and Cargo and
+the script both follow it transparently.
 
 ## Build
 
