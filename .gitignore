@@ -5,3 +5,13 @@
 # Local toolchain (zig, cargo-zigbuild) kept beside the project, as
 # scripts/build-arm.* expects. It is a per-machine download, never committed.
 /.tools
+
+# Editor state. JetBrains ships a `.gitignore` inside this directory that only
+# covers `workspace.xml` and friends, so the directory itself has to be named
+# here or it shows up as untracked on every branch.
+/.idea
+
+# Where `conf/frpc.ini` points `log_file`, and what the legacy example writes to
+# the working directory when it is run from the repository root. Both are
+# outputs of running the examples, not sources.
+/frpc.log

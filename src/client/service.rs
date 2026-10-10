@@ -392,6 +392,11 @@ async fn login_again(
 ) -> Result<()> {
     let mut backoff = Backoff::new(FastBackoffOptions {
         max_duration: RECONNECT_MAX_INTERVAL,
+        // Go sets only `Duration`, `Factor`, `Jitter` and `MaxDuration` here
+        // (`client/service.go:360-366`), so `FastRetryCount` is its zero value:
+        // this curve has no fast-retry layer at all. Inheriting the default's
+        // three would put a 200 ms retry between every step of the climb.
+        fast_retry_count: 0,
         ..FastBackoffOptions::default()
     });
     loop {
@@ -524,13 +529,21 @@ mod tests {
     /// manager for both is what made the delays come out wrong.
     #[test]
     fn a_failing_login_phase_climbs_to_the_ceiling_without_fast_retries() {
+        // The same options `login_again` builds, so the test fails if that
+        // construction drifts — in particular if the default's fast retries are
+        // inherited, which would put a 200 ms step between every one of these.
         let mut backoff = Backoff::new(FastBackoffOptions {
             max_duration: RECONNECT_MAX_INTERVAL,
+            fast_retry_count: 0,
             ..FastBackoffOptions::default()
         });
-        // Jitter is `duration + rand * 0.1 * duration`, so each delay lands in
-        // `[base, base * 1.1]`.
-        let expected = [
+        // Jitter is `duration + rand * 0.1 * duration`, and it *compounds*: each
+        // step multiplies the previous step's already-jittered value, so the
+        // bound widens as `2^n * 1.1^n` rather than staying at 10% above a clean
+        // doubling. Asserting exact per-step bounds would therefore be wrong, so
+        // this pins the shape instead — it starts at the base, never decreases,
+        // never dips into the fast-retry range, and lands on the cap.
+        let clean_doubling = [
             Duration::from_secs(1),
             Duration::from_secs(2),
             Duration::from_secs(4),
@@ -539,14 +552,27 @@ mod tests {
             Duration::from_secs(20),
             Duration::from_secs(20),
         ];
-        for (index, base) in expected.into_iter().enumerate() {
+
+        let mut previous = Duration::ZERO;
+        for (index, base) in clean_doubling.into_iter().enumerate() {
             let delay = backoff.next(true);
-            let slack = base / 10;
             assert!(
-                delay >= base && delay <= base + slack,
-                "delay {index} = {delay:?}, expected {base:?} plus at most 10%",
+                delay >= base,
+                "delay {index} = {delay:?} is below the clean doubling {base:?}",
             );
+            assert!(
+                delay >= previous,
+                "delay {index} = {delay:?} went backwards from {previous:?}",
+            );
+            // The fast-retry layer would show up as roughly 200–300 ms.
+            assert!(
+                delay >= Duration::from_secs(1),
+                "delay {index} = {delay:?} is a fast retry, not a step of the climb",
+            );
+            previous = delay;
         }
+        // The cap is applied after jitter, so reaching it is exact.
+        assert_eq!(previous, RECONNECT_MAX_INTERVAL);
     }
 
     #[test]
