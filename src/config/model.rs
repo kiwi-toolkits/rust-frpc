@@ -746,13 +746,15 @@ impl ProxyConfig {
 
     /// Whether this proxy has a local side this client can actually run.
     ///
-    /// False for a plugin that is only parsed, and for a `wireType` that would
-    /// announce a type whose protocol this side does not speak. The startup path
-    /// reports those and carries on with the rest rather than refusing the whole
-    /// config — an unimplemented plugin is not a reason to lose every other
-    /// tunnel in the file.
+    /// False for an `xtcp` proxy, for a plugin that is only parsed, and for a
+    /// `wireType` that would announce a type whose protocol this side does not
+    /// speak. The startup path reports those and carries on with the rest rather
+    /// than refusing the whole config — one unimplemented feature is not a reason
+    /// to lose every other tunnel in the file.
     pub fn is_runnable(&self) -> bool {
-        self.wire_type_is_runnable() && !matches!(self.plugin, Some(PluginConfig::Http2Http { .. }))
+        self.wire_type_is_runnable()
+            && !matches!(self.kind, ProxyKind::Xtcp { .. })
+            && !matches!(self.plugin, Some(PluginConfig::Http2Http { .. }))
     }
 
     /// Why [`is_runnable`](Self::is_runnable) said no.
@@ -762,6 +764,9 @@ impl ProxyConfig {
                 "wireType {:?} is not a type this client can run",
                 self.wire_type
             );
+        }
+        if matches!(self.kind, ProxyKind::Xtcp { .. }) {
+            return "xtcp needs NAT hole punching, which is not implemented".to_string();
         }
         match self.plugin.as_ref() {
             Some(plugin) => format!("plugin {} is not implemented", plugin.type_name()),
@@ -1254,6 +1259,18 @@ impl ClientConfig {
                     *enable_http2 = Some(true);
                 }
             }
+        }
+
+        // `CompleteVisitorConfigurers` (`pkg/config/load.go:457`) does the same
+        // for visitors, and the default matters more here than it looks: a
+        // visitor with no `bindAddr` would otherwise be bound to `0.0.0.0` by an
+        // empty host in `join_host_port`, publishing a port the operator
+        // expected on loopback to the whole network.
+        for visitor in &mut self.visitors {
+            visitor.bind_addr = empty_or(&visitor.bind_addr, "127.0.0.1").to_string();
+            visitor
+                .transport
+                .get_or_insert_with(VisitorTransport::default);
         }
     }
 

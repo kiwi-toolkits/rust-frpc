@@ -826,6 +826,18 @@ async fn open_work_conn(
         return Ok(());
     }
 
+    // An `xtcp` proxy is the one type left with no local side: it needs NAT hole
+    // punching. `serve_one` can already dial `localIP:localPort` for anything TCP
+    // shaped, but the server will not hand over a work connection the way it does
+    // for `tcp`, so bridging it would silently drop every user connection.
+    if proxy.type_name() == "xtcp" {
+        logging::warn(format!(
+            "proxy {name}: xtcp needs NAT hole punching, which is not implemented; \
+             refusing the work connection"
+        ));
+        return Ok(());
+    }
+
     // An `stcp` proxy looks different from the outside but is served the same
     // way: the server still asks for a work connection and then joins it to the
     // visitor connection on its side. Verified against a real `frps` — the first

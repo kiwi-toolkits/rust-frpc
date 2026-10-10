@@ -54,8 +54,26 @@ and the places where this client deliberately differs.
   `tcpMux` is on, which it is by default.
 * Legacy INI keeps `IgnoreInlineComment`: a trailing `# comment` on a value line
   becomes **part of the value**. It is faithful, not a bug.
+* Legacy INI strips one matching pair of surrounding quotes, because
+  `PreserveSurroundedQuote` is off on frp's parser. It is the narrow predicate,
+  not "starts and ends with the same character": go-ini's `hasSurroundedQuote`
+  also requires the body to contain no other quote of that kind, so `"a"b"`
+  keeps its quotes. This matters in practice — `token = "abc"` authenticates with
+  `abc` under frp, and keeping the quotes produces a failure that looks exactly
+  like a wrong token.
 * Legacy INI prefix handling is asymmetric: `meta_*` strips its prefix, `plugin_*`
   keeps it, `header_*` strips it.
+* `role = visitor` sections are converted the way `Convert_VisitorConf_To_v1`
+  converts them, from TOML and legacy INI alike — the section name becomes the
+  name, and `sk`/`server_name`/`bind_addr`/`bind_port` land on the base config.
+  A visitor with no `bindAddr` gets `127.0.0.1` from `CompleteVisitorConfigurers`;
+  without that default an empty host binds every interface, which is a silent
+  change in exposure rather than in behaviour.
+* The legacy `log_*` keys are remapped, not renamed by the user: `log_file` is
+  `to`, `log_level` is `level`, `log_max_days` is `maxDays`, `disable_log_color`
+  is `disablePrintColor`. `log_way` is dead in Go — defined, defaulted, and never
+  read by `Convert_ClientCommonConf_To_v1` — so a `log_way = file` with no
+  `log_file` goes to the console in both implementations.
 
 ## Multiplexing
 
@@ -191,14 +209,21 @@ docs too.
 | `frps` | Not implemented | Out of scope; the Go server is the counterpart. |
 | `useCompression` on work connections | Refused | Not implemented yet. The registration told the server the connection is compressed, so bridging it in the clear would corrupt the stream rather than fail loudly. |
 | `useEncryption`/`useCompression` on a `udp` proxy | Refused | Same reason: the wrapping applies to the packet stream itself and is not wired up, so the work connection is refused rather than bridged unwrapped. |
-| Proxy types | All but `xtcp`, so far | The rest of the registration messages already exist in `msg.rs`; the local side of each type is the work. |
+| Proxy types | All but `xtcp`, so far | `xtcp` needs NAT hole punching. The registration messages for everything else already exist in `msg.rs`, and the local side of each is the same bridge. |
 | Plugins | None, yet | A config naming one is reported and that proxy is skipped, so the rest of the file still runs. |
-| Visitors | `stcp` and `sudp` | `xtcp` needs NAT hole punching, and a config naming it is skipped with a warning rather than half-run. |
+| Visitors | `stcp` and `sudp`, from TOML and legacy INI alike | `xtcp` needs NAT hole punching, and a config naming it is skipped with a warning rather than half-run. |
+| Health checks | Parsed, not run | `healthCheck` is accepted and the proxy still registers, but nothing polls it, so an unhealthy backend is never withdrawn. |
+| `udpPacketSize` | Parsed, not honoured | The client's buffer is the protocol ceiling (65507) rather than the configured value, which only ever makes the client accept more than it was told to. |
+| `dnsServer`, `natHoleStunServer`, `store`, `webServer.assetsDir`, `webServer.pprofEnable`, OIDC | Parsed, not used | Each is reported rather than silently dropped. `auth.method = "oidc"` validates but then authenticates with the token. |
+| `renameOnConflict` | Parsed, not applied | The `ex_1_ → ex_2_ → ex_3_` sequence is implemented against `rust-tiny-frpc`, but turning it on changes a proxy's public name, so it stays off until asked for. |
 | Wire protocol | v1 only | The v2 framing is implemented and tested, but the `ClientHello`/`ServerHello` exchange is not, so a `v2` config cannot complete a session. |
 | Admin API | No HTTP framework | Written on `tokio` directly, because the surface is eight routes and a framework costs more binary size than the routing it replaces — which matters for a crate whose point is the size of the process. |
 | `/metrics` | Added, off by default | Proxy/connection/traffic counters in plain text, no Prometheus client library. |
 | `--check-config` | Added | Validate and print the normalized config, then exit. For CI and pre-deploy checks. |
-| `log.format = "json"` | Added | For log pipelines. Text stays the default, byte-compatible with the Go output. |
+| `--log-level` | Added | The Go root client has no such flag; it is only on the per-type proxy subcommands. |
+| `log.format = "json"` and `log.color` | Added | For log pipelines. Text stays the default, and is what matches the Go output. |
+| `wireType` | Added | `virtual_net` uses it upstream; nothing else does. Only `tcp` and `udp` are honoured, since announcing a type this side cannot speak would register a proxy that never works. |
 | `quic` transport | Not supported | The Rust QUIC stack costs binary size and build time; `kcp` covers the same weak-network case for now. |
+| YAML and JSON configs | Not supported | Go sniffs all three formats by content; this dispatches legacy-INI versus TOML only. A `.yaml` or `.json` config is read as TOML and fails rather than being misread. |
 | Version string | `rust-frpc.<version>` | `frps` logs it and the dashboard shows it, so an operator can tell which client is which. No compatibility impact. |
 | Rename retry | Parsed, not yet applied | Same `ex_1_ → ex_2_ → ex_3_` sequence as `rust-tiny-frpc`. Turning it on changes a proxy's public name, so it should be a decision — and it is off by default. |

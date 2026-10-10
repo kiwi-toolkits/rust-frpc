@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+* **Log output matches `golib` line for line.** `2006-01-02 15:04:05.000 [I]
+  [service.go:332] [runID] …` — the fixed-width local timestamp, the one-letter
+  level, the upstream Go caller site from a hand-maintained map, and the run-id
+  and proxy-name prefixes. The previous format used RFC3339, spelled the level
+  `[INFO]`, and carried neither of the last two; the module comment claiming it
+  was "line-for-line the same as the Go client's" was quoting a format that
+  appears nowhere in frp or golib.
+* **`log.to` writes a file, and `log.maxDays` rotates it.** All three of
+  `log.to`, `log.maxDays` and `log.disablePrintColor` were parsed and then
+  ignored, so `log.to = "./frpc.log"` — the value the shipped Go example uses —
+  produced no file and logs went to stdout regardless. A failed file destination
+  now logs to stderr rather than taking the client down.
+* **`role = visitor` in a legacy INI file now starts the visitor.** The sections
+  were parsed and then reported as unsupported, which had been true once but was
+  not any more: `stcp` and `sudp` visitors have worked for a while. Only `xtcp`
+  is genuinely missing, and only it is reported now.
+* **Legacy INI strips surrounding quotes from values.** `PreserveSurroundedQuote`
+  is off on frp's parser, so `token = "abc"` authenticates with `abc`. Keeping
+  the quotes produced a failure indistinguishable from a wrong token.
+* **A visitor with no `bindAddr` gets `127.0.0.1`.** `complete()` only walked the
+  proxies, so a visitor's address stayed empty and `":9000"` bound every
+  interface — a quiet change in exposure for anyone expecting loopback.
+* **An `xtcp` proxy is reported instead of silently bridging.** It was falling
+  through to the ordinary TCP bridge, which would have accepted work connections
+  the server never sends, producing a proxy that appears registered and carries
+  nothing.
+* **`conf/frpc.ini` and `conf/frpc_full_example.ini`.** The legacy example moved
+  out of `conf/legacy/` so the example files pair up by name, and a minimal INI
+  example now sits beside the minimal TOML one. Both document what the INI format
+  actually does — the literal values, the quote stripping, and the inline-comment
+  rule.
 * **A stable `tcpMux` session.** The yamux keepalive sent its ping into the
   outbound queue and then waited for the reply *inside the one loop that drains
   that queue* — so the ping was never written and the reply it waited for could
@@ -10,6 +41,14 @@
   roughly 40-second intervals. The wait now runs in a task of its own, so the ping
   reaches the socket before anything is waited on. A regression test
   (`a_session_survives_a_keepalive_cycle`) fails against the old code.
+* **The reconnect backoff matches Go's two managers.** Go builds a fresh
+  `BackoffUntil` manager inside `loopLoginUntilSuccess` for each login phase and
+  keeps a separate one for the gap after a session dies; one manager was reused
+  for both, so the two curves shared their failure counts, and the login-phase
+  copy inherited three 200 ms fast retries that Go does not configure there. The
+  first login also used a flat 10-second interval where Go uses the same
+  `1s → ×2 → 10s` curve, and a hand-rolled "healthy session" reset has been
+  removed — Go has no such rule.
 * **The read half no longer outlives a dead session.** A frame handler can park on
   the outbound queue or on a socket read, and a session that died while it was
   parked could not make it return — leaving the reader holding the socket's write
@@ -136,15 +175,31 @@ Features:
 
 ## Not yet implemented
 
+Everything here is *parsed and reported* rather than silently ignored: either the
+proxy is skipped with a warning naming it, or `--check-config` says so. A config
+that uses one of these will not fail to load, and the option will not take
+effect.
+
 * `useCompression` on work connections, and `useEncryption`/`useCompression` on
   `udp` proxies or visitors: a proxy that asks for either has its connections
   refused rather than bridged unwrapped, since the registration told the server
   otherwise.
 * The TLS, websocket and KCP transports.
-* Proxy types other than `tcp`, `udp`, `http`, `https`, `tcpmux`, `stcp` and
-  `sudp`, and the client-side plugins — a config naming one is reported and that
-  proxy is skipped.
-* The `xtcp` visitor and proxy, which need NAT hole punching.
+* The client-side plugins — `http_proxy`, `socks5`, `static_file`,
+  `unix_domain_socket`, `tls2raw`, `http2http` and the `https2*` family — and
+  their `http2https` shape. A proxy naming one is skipped.
+* The `xtcp` proxy and visitor, which need NAT hole punching. Everything else
+  registers and runs: `tcp`, `udp`, `http`, `https`, `tcpmux`, `stcp` and `sudp`.
+* Health checks. A `healthCheck` proxy registers and is never withdrawn, because
+  nothing polls it.
+* `udpPacketSize`, which is accepted but not applied; the client's buffer is the
+  protocol ceiling.
+* `dnsServer`, `natHoleStunServer`, `store`, `webServer.assetsDir`,
+  `webServer.pprofEnable`, and OIDC authentication. `auth.method = "oidc"`
+  validates and then authenticates with the token.
+* YAML and JSON configs. Go sniffs all three formats by content; this
+  distinguishes legacy INI from TOML only. A `.yaml` or `.json` file is read as
+  TOML and fails rather than being misread.
 * `/api/visitor/{name}/config`, `/api/store/*`, and the static dashboard assets.
 * Wire protocol v2. `msg.rs` encodes and decodes both framings, but the v2
   `ClientHello` exchange is not implemented, so only v1 is usable end to end —

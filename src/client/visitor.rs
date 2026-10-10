@@ -86,7 +86,15 @@ impl Visitor {
         let transport = config.transport.clone().unwrap_or_default();
         Some(Self {
             name: config.name.clone(),
-            bind_addr: config.bind_addr.clone(),
+            // Belt and braces: `ClientConfig::complete` already defaults this to
+            // loopback, but a `VisitorConfig` built by hand — as the INI reader
+            // and the tests do — can still arrive empty, and an empty host binds
+            // every interface. `CompleteVisitorConfigurers` is the Go equivalent.
+            bind_addr: if config.bind_addr.is_empty() {
+                "127.0.0.1".to_string()
+            } else {
+                config.bind_addr.clone()
+            },
             // A negative `bindPort` means "receive visitor connections only,
             // without a local listener", which this does not implement.
             bind_port: u16::try_from(config.bind_port).unwrap_or(0),

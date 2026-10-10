@@ -88,8 +88,15 @@ curl localhost:7400/metrics  # 纯文本计数器
   绑定一个端口（`sudp` 为 UDP）并指名它要访问的代理。`xtcp` visitor 会记录警告并跳过。
   `sudp` 的会话属于 visitor 而非某个用户：第一个数据报开启会话，之后任意用户的数据报都走同一条
   会话，每条都带着自己的来源地址——回答正是靠它回到正确的人手上。
-* 本地侧跑不了的代理（插件未实现、或 `wireType` 不是本客户端支持的类型）会被记录并跳过，
-  不会因为其中一个而让配置文件里的其它隧道一起失效。
+* legacy INI 里 `role = visitor` 的段会真正转换成 visitor 并启动（`stcp`/`sudp`），只有
+  `xtcp` 会被记录并跳过。未指定 `bindAddr` 的 visitor 默认 `127.0.0.1`，与
+  `CompleteVisitorConfigurers` 一致——否则空主机名会把端口绑到所有网卡上。
+* 本地侧跑不了的代理（`xtcp`、未实现的插件、或本客户端不支持的 `wireType`）会被记录并跳过，
+  不会因为其中一个而让配置文件里的其它隧道一起失效。`--check-config` 在部署前就会给出同样的提示。
+* 日志与 `golib` 对齐：`2006-01-02 15:04:05.000 [I] [service.go:332] [runID] …`，级别是单字母，
+  带上游 Go 的调用位置，以及 runID / proxyName 前缀。`log.to` 会写按天轮转的文件并遵守
+  `maxDays`，`log.disablePrintColor` 关闭控制台配色。legacy INI 的 `log_file`、`log_level`、
+  `log_max_days`、`disable_log_color` 含义相同，Go 的转换器也是这么处理的。
 * 以下能力尚未接通，且都是**明确拒绝而非半成品**：线协议 `v2`（`msg.rs` 里有分帧实现，
   但 `ClientHello` 交换未实现）、工作连接的 `useCompression`、以及 `udp` 代理上的
   `useEncryption`/`useCompression`。

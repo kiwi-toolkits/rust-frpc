@@ -23,7 +23,8 @@ use crate::util::range::parse_range_numbers;
 use super::model::{
     AuthClientConfig, ClientCommonConfig, ClientConfig, ClientTransportConfig, HeaderOperations,
     HealthCheckConfig, LoadBalancerConfig, LogConfig, PluginConfig, ProxyConfig, ProxyKind,
-    ProxyTransport, Qos, StoreConfig, TlsClientConfig, WebServerConfig,
+    ProxyTransport, Qos, StoreConfig, TlsClientConfig, VisitorConfig, VisitorKind,
+    VisitorTransport, WebServerConfig,
 };
 
 /// A parsed INI file, plus the sections the client model cannot hold yet.
@@ -32,6 +33,68 @@ pub struct ParsedIni {
     pub config: ClientConfig,
     /// Sections with `role = visitor`, kept as raw key/value maps.
     pub visitors: Vec<BTreeMap<String, String>>,
+}
+
+/// Turns `role = visitor` sections into visitors.
+///
+/// The shape of the conversion is `Convert_VisitorConf_To_v1_Base`
+/// (`pkg/config/legacy/conversion.go:317`): the section name becomes the
+/// visitor's name, and `sk`/`server_user`/`server_name`/`bind_addr`/`bind_port`
+/// land on the base config.
+///
+/// Returns the visitors it could build, and the names of the sections it could
+/// not — an `xtcp` visitor parses fine but has no local implementation, so it is
+/// reported rather than silently dropped.
+pub fn visitors_from_sections(
+    sections: &[BTreeMap<String, String>],
+) -> Result<(Vec<VisitorConfig>, Vec<String>)> {
+    let mut visitors = Vec::new();
+    let mut skipped = Vec::new();
+
+    for section in sections {
+        let get = |key: &str| section.get(key).cloned().unwrap_or_default();
+        let name = get("name");
+        if name.is_empty() {
+            continue;
+        }
+        let kind = match get("type").as_str() {
+            "stcp" => VisitorKind::Stcp {},
+            "sudp" => VisitorKind::Sudp {},
+            "xtcp" => {
+                skipped.push(name);
+                continue;
+            }
+            other => {
+                return Err(Error::config(format!(
+                    "type [{other}] error: not a visitor type"
+                )))
+            }
+        };
+
+        let (use_encryption, use_compression) = (
+            get("use_encryption") == "true",
+            get("use_compression") == "true",
+        );
+
+        visitors.push(VisitorConfig {
+            name,
+            enabled: None,
+            kind,
+            server_name: get("server_name"),
+            server_user: get("server_user"),
+            bind_addr: get("bind_addr"),
+            bind_port: get("bind_port").parse().unwrap_or(0),
+            secret_key: Secret::new(get("sk")),
+            transport: Some(VisitorTransport {
+                use_encryption,
+                use_compression,
+            }),
+            nat_traversal: None,
+            plugin: None,
+        });
+    }
+
+    Ok((visitors, skipped))
 }
 
 /// Whether the text should be handled as legacy INI: it must parse as INI *and*
@@ -575,6 +638,7 @@ struct IniFile {
 /// * `#` and `;` start a comment only at the *start* of a line — inline comments
 ///   are part of the value (`IgnoreInlineComment`);
 /// * a `\` at the end of a line continues the value;
+/// * a value wrapped in a matching pair of quotes loses them;
 /// * keys outside any section land in `DEFAULT`.
 fn parse_ini(content: &str) -> Result<IniFile> {
     let mut file = IniFile::default();
@@ -616,6 +680,7 @@ fn parse_ini(content: &str) -> Result<IniFile> {
             }
         }
 
+        let value = strip_surrounding_quotes(&value);
         file.sections
             .entry(current.clone())
             .or_default()
@@ -623,6 +688,29 @@ fn parse_ini(content: &str) -> Result<IniFile> {
     }
 
     Ok(file)
+}
+
+/// Removes one matching pair of surrounding quotes, as go-ini does.
+///
+/// `PreserveSurroundedQuote` is false by frp's parser, so this is on. The
+/// predicate is narrower than "starts and ends with the same quote": go-ini's
+/// `hasSurroundedQuote` also requires the closing quote to be the *only* one of
+/// its kind in the body, so `a"b"` keeps its quotes — and, more to the point,
+/// `"a"b"` does too. Reimplemented exactly rather than approximated, because a
+/// config carrying `token = "abc"` authenticates with `abc` under frp and would
+/// fail against this client otherwise.
+fn strip_surrounding_quotes(value: &str) -> String {
+    let bytes = value.as_bytes();
+    for quote in *b"'\"" {
+        let wrapped = bytes.len() >= 2
+            && bytes[0] == quote
+            && bytes[bytes.len() - 1] == quote
+            && !bytes[1..bytes.len() - 1].contains(&quote);
+        if wrapped {
+            return value[1..value.len() - 1].to_string();
+        }
+    }
+    value.to_string()
 }
 
 /// Splits `key = value` or `key: value` at whichever separator comes first. A
@@ -657,6 +745,39 @@ mod tests {
             file.sections["common"]["token"],
             "abc # not a comment".to_string()
         );
+    }
+
+    #[test]
+    fn a_value_wrapped_in_quotes_loses_them() {
+        // `PreserveSurroundedQuote` is false on frp's parser, so `token = "abc"`
+        // authenticates with `abc`. Keeping the quotes would look exactly like a
+        // wrong token at the server, which is why this is pinned rather than
+        // left to the implementation.
+        let file = parse_ini("[common]\na = \"abc\"\nb = 'def'\nc = plain\nd = \"\"\n").unwrap();
+        assert_eq!(file.sections["common"]["a"], "abc");
+        assert_eq!(file.sections["common"]["b"], "def");
+        assert_eq!(file.sections["common"]["c"], "plain");
+        // An empty quoted value becomes empty: go-ini's predicate is
+        // `IndexByte(body, quote) == len(body)`, which holds for `""` because
+        // the body really is empty.
+        assert_eq!(file.sections["common"]["d"], "");
+    }
+
+    #[test]
+    fn quotes_are_kept_when_the_body_contains_the_same_quote() {
+        // `hasSurroundedQuote` additionally requires the closing quote to be the
+        // only one of its kind inside, so these keep their quotes. It is the
+        // narrow predicate, not "starts and ends the same".
+        let file = parse_ini("[common]\na = \"a\"b\"\nb = x\"y\"\n").unwrap();
+        assert_eq!(file.sections["common"]["a"], "\"a\"b\"");
+        assert_eq!(file.sections["common"]["b"], "x\"y\"");
+    }
+
+    #[test]
+    fn a_single_quote_character_is_not_stripped() {
+        let file = parse_ini("[common]\na = \"\nb = '\n").unwrap();
+        assert_eq!(file.sections["common"]["a"], "\"");
+        assert_eq!(file.sections["common"]["b"], "'");
     }
 
     #[test]

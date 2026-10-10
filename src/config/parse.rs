@@ -78,19 +78,21 @@ pub fn load_from_str(content: &str) -> Result<LoadedConfig> {
 /// Parses config text with an explicit strictness.
 pub fn load_from_str_with(content: &str, strictness: Strictness) -> Result<LoadedConfig> {
     if ini::looks_like_legacy_ini(content) {
-        let parsed = ini::parse_client_config_detailed(content)?;
+        let mut parsed = ini::parse_client_config_detailed(content)?;
+        // `role = visitor` sections become visitors rather than proxies, the
+        // same conversion `Convert_VisitorConf_To_v1` performs. Sections whose
+        // type has no local implementation are dropped here and reported.
+        let (visitors, skipped) = ini::visitors_from_sections(&parsed.visitors)?;
+        parsed.config.visitors = visitors;
+        parsed.config.complete();
+
         let mut warnings = Vec::new();
-        if !parsed.visitors.is_empty() {
-            let names: Vec<&str> = parsed
-                .visitors
-                .iter()
-                .filter_map(|visitor| visitor.get("name"))
-                .map(String::as_str)
-                .collect();
+        if !skipped.is_empty() {
             warnings.push(format!(
-                "ignoring {} visitor section(s) [{}]: visitor support is not implemented yet",
-                names.len(),
-                names.join(", ")
+                "{} visitor section(s) [{}] use a type this client cannot run; \
+                 they are not started",
+                skipped.len(),
+                skipped.join(", ")
             ));
         }
         return Ok(LoadedConfig {
@@ -518,10 +520,12 @@ mod tests {
         assert!(visitor.transport.as_ref().unwrap().use_compression);
     }
 
-    /// Visitor sections are understood but not implemented, so they must be
-    /// reported rather than silently dropped.
+    /// A `role = visitor` section becomes a visitor, not a warning.
+    ///
+    /// `stcp` and `sudp` visitors run; `xtcp` has no local implementation yet,
+    /// and that one is reported.
     #[test]
-    fn legacy_visitor_sections_produce_a_warning() {
+    fn legacy_visitor_sections_become_visitors() {
         let loaded = load_from_str(
             r#"
             [common]
@@ -535,16 +539,35 @@ mod tests {
             role = visitor
             type = stcp
             server_name = secret_tcp
+            sk = abc
             bind_port = 9000
+
+            [p2p_visitor]
+            role = visitor
+            type = xtcp
+            server_name = p2p
+            bind_port = 9001
             "#,
         )
         .unwrap();
 
         assert_eq!(loaded.config.proxies.len(), 1);
         assert_eq!(loaded.config.proxies[0].name, "secret_tcp");
-        assert_eq!(loaded.warnings.len(), 1);
+
+        // The stcp visitor arrived, and `bindAddr` picked up its default on the
+        // way — an empty host would have bound every interface.
+        assert_eq!(loaded.config.visitors.len(), 1);
+        let visitor = &loaded.config.visitors[0];
+        assert_eq!(visitor.name, "secret_tcp_visitor");
+        assert_eq!(visitor.server_name, "secret_tcp");
+        assert_eq!(visitor.bind_addr, "127.0.0.1");
+        assert_eq!(visitor.bind_port, 9000);
+        assert_eq!(visitor.secret_key.expose(), "abc");
+
+        // The xtcp one is the only thing left to warn about.
+        assert_eq!(loaded.warnings.len(), 1, "{:?}", loaded.warnings);
         assert!(
-            loaded.warnings[0].contains("secret_tcp_visitor"),
+            loaded.warnings[0].contains("p2p_visitor"),
             "{:?}",
             loaded.warnings
         );

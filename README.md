@@ -100,9 +100,20 @@ from a half-parsed file: an unreadable config is logged and ignored.
   A `sudp` session belongs to the visitor rather than to a user: the first datagram
   opens it, later datagrams from any user ride on it, and each carries the address
   it came from, which is how the answer gets back to the right one.
-* A proxy whose local side this client cannot run — an unimplemented plugin, or a
-  `wireType` it does not speak — is reported and skipped, so one of them does not
-  cost you the other tunnels in the file.
+* A proxy whose local side this client cannot run — `xtcp`, an unimplemented
+  plugin, or a `wireType` it does not speak — is reported and skipped, so one of
+  them does not cost you the other tunnels in the file. `--check-config` says the
+  same thing before you deploy.
+* The same goes for legacy INI `role = visitor` sections: `stcp` and `sudp` are
+  converted and run, and only `xtcp` is reported as skipped. A visitor with no
+  `bindAddr` gets `127.0.0.1`, as `CompleteVisitorConfigurers` gives it — without
+  that it would bind every interface.
+* Logging matches `golib`: `2006-01-02 15:04:05.000 [I] [service.go:332] [runID] …`,
+  with the one-letter level, the upstream Go caller site, and the run-id and
+  proxy-name prefixes. `log.to` writes a daily-rotated file and honours
+  `maxDays`; `log.disablePrintColor` turns the console colours off. The legacy
+  INI spellings (`log_file`, `log_level`, `log_max_days`, `disable_log_color`)
+  mean the same thing, which is also what Go's converter does with them.
 * Not yet wired up, and each refused rather than half-done: wire protocol `v2`
   (the framing exists in `msg.rs` but the `ClientHello` exchange does not),
   `useCompression` on a work connection, and `useEncryption`/`useCompression` on a
