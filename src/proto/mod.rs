@@ -4,7 +4,7 @@
 //! corruption rather than an error:
 //!
 //! ```text
-//! transport (tcp/tls/websocket/kcp)
+//! transport (tcp + tls, or websocket + tls, or wss)
 //!   └── optional snappy framed compression      (use_compression)
 //!         └── optional AES-128-CFB stream       (use_encryption, and always
 //!                                                on the control connection)
@@ -20,6 +20,7 @@ pub mod connector;
 pub mod mux;
 pub mod stream;
 pub mod transport;
+pub mod websocket;
 
 pub use codec::{Codec, WireProtocol};
 pub use connector::{Connector, LogicalConn};

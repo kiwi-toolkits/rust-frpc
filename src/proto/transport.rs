@@ -86,7 +86,7 @@ impl Protocol {
     /// `wss` implies TLS whatever `transport.tls.enable` says — the Go client
     /// sets `tlsEnable = true` for it before it reads the option.
     pub fn is_implemented(self) -> bool {
-        matches!(self, Protocol::Tcp)
+        matches!(self, Protocol::Tcp | Protocol::Websocket | Protocol::Wss)
     }
 }
 
@@ -133,7 +133,8 @@ impl Dial {
         })?;
         if !protocol.is_implemented() {
             return Err(Error::config(format!(
-                "transport.protocol {:?} is not implemented yet; use \"tcp\"",
+                "transport.protocol {:?} is not implemented yet; use \"tcp\", \"websocket\" or \
+                 \"wss\"",
                 protocol.name()
             )));
         }
@@ -191,6 +192,7 @@ pub enum Stream {
     /// The inner `Stream` is boxed because the type would otherwise contain
     /// itself.
     Tls(Box<tokio_rustls::client::TlsStream<Stream>>),
+    Websocket(Box<super::websocket::WebSocket<Stream>>),
 }
 
 impl AsyncRead for Stream {
@@ -202,6 +204,7 @@ impl AsyncRead for Stream {
         match self.get_mut() {
             Stream::Tcp(socket) => std::pin::Pin::new(socket).poll_read(cx, buf),
             Stream::Tls(tls) => std::pin::Pin::new(tls.as_mut()).poll_read(cx, buf),
+            Stream::Websocket(ws) => std::pin::Pin::new(ws.as_mut()).poll_read(cx, buf),
         }
     }
 }
@@ -215,6 +218,7 @@ impl AsyncWrite for Stream {
         match self.get_mut() {
             Stream::Tcp(socket) => std::pin::Pin::new(socket).poll_write(cx, buf),
             Stream::Tls(tls) => std::pin::Pin::new(tls.as_mut()).poll_write(cx, buf),
+            Stream::Websocket(ws) => std::pin::Pin::new(ws.as_mut()).poll_write(cx, buf),
         }
     }
 
@@ -225,6 +229,7 @@ impl AsyncWrite for Stream {
         match self.get_mut() {
             Stream::Tcp(socket) => std::pin::Pin::new(socket).poll_flush(cx),
             Stream::Tls(tls) => std::pin::Pin::new(tls.as_mut()).poll_flush(cx),
+            Stream::Websocket(ws) => std::pin::Pin::new(ws.as_mut()).poll_flush(cx),
         }
     }
 
@@ -235,18 +240,46 @@ impl AsyncWrite for Stream {
         match self.get_mut() {
             Stream::Tcp(socket) => std::pin::Pin::new(socket).poll_shutdown(cx),
             Stream::Tls(tls) => std::pin::Pin::new(tls.as_mut()).poll_shutdown(cx),
+            Stream::Websocket(ws) => std::pin::Pin::new(ws.as_mut()).poll_shutdown(cx),
         }
     }
 }
 
 /// Dials, then applies the transport's layers in the order the Go hooks do.
+///
+/// The order is not the order the hooks are registered in, and it is not the
+/// same for every protocol. `wss` is the odd one: its TLS hook is registered at
+/// priority 100 and its websocket hook at 110, so TLS is the outer layer and the
+/// websocket handshake happens inside it. For plain `websocket` both hooks sit at
+/// `DefaultAfterHookPriority`, the websocket one was registered first, and so
+/// TLS ends up inside the websocket — which is the arrangement that surprises
+/// people, and the one that has to be right for the handshake to complete at all.
 pub async fn connect(dial: &Dial) -> Result<Stream> {
     let socket = dial_tcp(&dial.addr, dial.timeout, &dial.local_ip, dial.keepalive).await?;
     let mut stream = Stream::Tcp(socket);
 
+    // `wss`: TLS first, then the websocket handshake over the encrypted stream,
+    // with the TLS server name standing in for the host in the handshake.
+    if dial.protocol == Protocol::Wss {
+        let tls = dial
+            .tls
+            .as_ref()
+            .expect("`wss` implies TLS, and `Dial::from_config` sets it");
+        stream = tls_over(stream, tls).await?;
+        stream = websocket_over(stream, &tls.server_name).await?;
+        return Ok(stream);
+    }
+
+    // `websocket`: the handshake runs in the clear, and everything after it goes
+    // inside the frames.
+    if dial.protocol == Protocol::Websocket {
+        stream = websocket_over(stream, &dial.addr).await?;
+    }
+
     if let Some(tls) = dial.tls.as_ref() {
-        // Registered first, so it runs first — and on a `websocket` connection
-        // that means inside the websocket stream. See the module comment.
+        // Registered before the TLS hook, so it runs before it — and on a
+        // `websocket` connection that means inside the websocket stream, which
+        // is what the module comment describes.
         if !tls.disable_custom_first_byte {
             use tokio::io::AsyncWriteExt;
             stream
@@ -262,6 +295,12 @@ pub async fn connect(dial: &Dial) -> Result<Stream> {
     }
 
     Ok(stream)
+}
+
+/// Runs the websocket handshake over `inner`.
+async fn websocket_over(inner: Stream, host: &str) -> Result<Stream> {
+    let ws = super::websocket::connect(inner, host).await?;
+    Ok(Stream::Websocket(Box::new(ws)))
 }
 
 /// Wraps `inner` in a TLS client session.
@@ -638,7 +677,7 @@ mod tests {
     /// `protocol` is rejected at dial construction, not at the first reconnect.
     #[test]
     fn an_unimplemented_protocol_is_refused_with_its_name() {
-        for name in ["kcp", "quic", "websocket", "wss"] {
+        for name in ["kcp", "quic"] {
             let mut common = crate::config::ClientCommonConfig::default();
             common
                 .transport
@@ -647,6 +686,21 @@ mod tests {
             let err = Dial::from_config(&common).unwrap_err();
             assert!(matches!(err, Error::Config(_)), "{name}: {err}");
             assert!(err.to_string().contains(name), "{name}: {err}");
+        }
+    }
+
+    /// The three that do dial, so a later regression cannot quietly turn one of
+    /// them back into a config error.
+    #[test]
+    fn the_implemented_protocols_all_build_a_dial() {
+        for name in ["tcp", "websocket", "wss"] {
+            let mut common = crate::config::ClientCommonConfig::default();
+            common
+                .transport
+                .get_or_insert_with(Default::default)
+                .protocol = name.into();
+            let dial = Dial::from_config(&common).unwrap_or_else(|err| panic!("{name}: {err}"));
+            assert_eq!(dial.protocol.name(), name);
         }
     }
 
@@ -669,10 +723,11 @@ mod tests {
         transport.protocol = "wss".into();
         transport.tls.get_or_insert_with(Default::default).enable = Some(false);
 
-        // `wss` is not dialable yet, so the protocol check fires first — the
-        // point here is that the *TLS* decision is not what stops it.
-        let err = Dial::from_config(&common).unwrap_err();
-        assert!(err.to_string().contains("wss"), "{err}");
+        let dial = Dial::from_config(&common).expect("`wss` dials");
+        assert!(
+            dial.tls.is_some(),
+            "`wss` is TLS with a websocket inside it, so `enable = false` cannot turn it off"
+        );
     }
 
     /// TLS defaults to on, and `serverName` falls back to `serverAddr`.
@@ -707,6 +762,102 @@ mod tests {
             .server_name = "frps.example.com".into();
         let dial = Dial::from_config(&common).unwrap();
         assert_eq!(dial.tls.as_ref().unwrap().server_name, "frps.example.com");
+    }
+
+    /// The layer order, read off the wire.
+    ///
+    /// This is the part of the transport that is easiest to get wrong and
+    /// hardest to debug: every combination below produces a connection that
+    /// *almost* works if two layers are swapped, and the symptom is a peer that
+    /// closes without saying why. Dial against a listener that reads a few bytes
+    /// and then gives up, and assert what those bytes are.
+    ///
+    /// The surprising row is `websocket` with TLS on — the default for that
+    /// protocol. It starts with `GET`, not with a TLS record, because the
+    /// websocket hook runs first: TLS is *inside* the websocket there. `wss` is
+    /// the one that starts with a ClientHello.
+    #[tokio::test]
+    async fn the_layers_go_on_in_the_order_the_go_hooks_run() {
+        /// Dials `dial` against a listener that captures what arrives first.
+        async fn first_bytes(mut dial: Dial) -> Vec<u8> {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let reader = tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut socket = listener.accept().await.unwrap().0;
+                let mut buf = [0u8; 16];
+                // A TLS handshake stalls here waiting for a ServerHello, and a
+                // plain dial sends nothing at all, so both ends have to be
+                // bounded. What was written before that is the answer.
+                let read = tokio::time::timeout(Duration::from_millis(500), socket.read(&mut buf))
+                    .await
+                    .ok()
+                    .and_then(std::result::Result::ok)
+                    .unwrap_or(0);
+                buf[..read].to_vec()
+            });
+
+            dial.addr = addr.to_string();
+            // The dial itself cannot finish — there is no server here — and the
+            // error is not what this is about.
+            let _ = connect(&dial).await;
+            reader.await.unwrap()
+        }
+
+        fn dial_for(protocol: &str, tls: Option<bool>) -> Dial {
+            let mut common = crate::config::ClientCommonConfig {
+                server_addr: "127.0.0.1".into(),
+                server_port: 7,
+                ..Default::default()
+            };
+            let transport = common.transport.get_or_insert_with(Default::default);
+            transport.protocol = protocol.into();
+            transport.tls.get_or_insert_with(Default::default).enable = tls;
+            Dial::from_config(&common).unwrap()
+        }
+
+        /// A TLS ClientHello record: handshake, version 3.x.
+        const CLIENT_HELLO: u8 = 0x16;
+
+        // `tcp` with TLS off: nothing is written until the frp layer has
+        // something to say.
+        assert!(first_bytes(dial_for("tcp", Some(false))).await.is_empty());
+
+        // `tcp` with TLS on: the ClientHello, and no 0x17 before it because
+        // `disableCustomTLSFirstByte` defaults to true.
+        assert_eq!(
+            first_bytes(dial_for("tcp", None)).await[0],
+            CLIENT_HELLO,
+            "plain tcp with tls is tls over tcp"
+        );
+
+        // `websocket` with TLS off: the handshake request, in the clear.
+        assert_eq!(
+            &first_bytes(dial_for("websocket", Some(false))).await[..4],
+            b"GET ",
+            "websocket starts with its own handshake"
+        );
+
+        // `websocket` with TLS on — the default: *still* the handshake request,
+        // and the ClientHello only appears inside the frames.
+        assert_eq!(
+            &first_bytes(dial_for("websocket", None)).await[..4],
+            b"GET ",
+            "tls over websocket puts the websocket handshake outermost"
+        );
+
+        // `wss`: the other way round, so the first byte is a TLS record.
+        assert_eq!(
+            first_bytes(dial_for("wss", None)).await[0],
+            CLIENT_HELLO,
+            "wss is a websocket handshake inside tls"
+        );
+        // And even `enable = false` cannot take the TLS out of `wss`.
+        assert_eq!(
+            first_bytes(dial_for("wss", Some(false))).await[0],
+            CLIENT_HELLO,
+            "wss implies tls"
+        );
     }
 
     /// A name has to reach the resolver, not the address parser.

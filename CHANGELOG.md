@@ -2,6 +2,42 @@
 
 ## Unreleased
 
+* **The `websocket` and `wss` transports.** `frp` uses `golang.org/x/net/websocket`
+  rather than the gorilla stack, and the two differ where it counts, so the new
+  `proto::websocket` is matched against x/net at the version frp pins: a plain
+  `GET /~!frp` upgrade, a base64 nonce in `Sec-WebSocket-Key`, a
+  `Sec-WebSocket-Accept` of `base64(sha1(key ‖ GUID))`, a persistent `Origin`
+  header, **masked** client frames (and a masked frame *from* the server treated
+  as a protocol error, which is what `hybiFrameHandler` does), one frame per
+  `write` with `FIN` set and the `BinaryFrame` opcode — which is what frp selects
+  so that a byte-oriented intermediary does not UTF-8-validate the tunnel — and
+  `Ping` answered with a `Pong`. An offered `Sec-WebSocket-Extensions` fails the
+  handshake rather than being ignored, because `permessage-deflate` would mean the
+  payload is no longer a byte stream this side can read.
+* **The layer order is the part that would have been silently wrong**, so it is
+  pinned by a test that reads the first bytes off a socket. `websocket` puts TLS
+  *inside* its frames — the default for that protocol, and the row that surprises
+  people — while `wss` and `tcp`-with-TLS start with a TLS record. That comes
+  from libnet's hook priorities, which are not the registration order:
+  `DefaultAfterHookPriority` is 10, `WithTLSConfig` is `MaxUint64`, and `wss`
+  overrides both at 100 and 110 to get the other arrangement. Three real-`frps`
+  tests cover the transport end to end: a login, a 40 KB round trip through yamux
+  inside the frames, and the same with TLS inside them.
+* **`wss` is client-side only, and that is upstream's shape rather than a gap
+  here.** `frps` sniffs its bind port for a `GET /~!frp` prefix and hands those
+  connections to a websocket listener; nothing unwraps TLS and *then* looks for a
+  websocket inside. frp's own end-to-end suite says so — "frps only supports ws,
+  so there should be a proxy to terminate TLS before frps" — and tests `wss` by
+  putting another `frpc` running `https2http` in front of the server. There is
+  therefore no `wss` integration test here, because there is nothing to point it
+  at; the layering test above is what covers the code, and `doc/compatibility.md`
+  records the limitation.
+* **A websocket frame parser had to be told where its own header ends.** With a
+  one-byte length field the four-byte masking key is still part of the header, so
+  a buffer that reached the end of the length field was reported as a complete
+  header and the key was then read as payload. Caught by
+  `a_short_prefix_does_not_parse_as_a_header`, which walks every prefix of a frame
+  and requires all of them to be refused until the header is whole.
 * **TLS on the control connection, which is the default path.** `transport.tls`
   was parsed and then ignored, and every dial was a plain TCP socket — so a
   server with `transport.tls.force = true` was simply unreachable, and every

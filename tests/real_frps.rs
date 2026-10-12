@@ -45,6 +45,9 @@ const REMOTE_PORT: u16 = 17_200;
 const REMOTE_PORT_NO_MUX: u16 = 17_201;
 /// The same for the TLS round trip, which runs against its own server.
 const REMOTE_PORT_TLS: u16 = 17_202;
+/// The same for the websocket round trips.
+const REMOTE_PORT_WS: u16 = 17_203;
+const REMOTE_PORT_WS_TLS: u16 = 17_204;
 /// The UDP port `frps` is asked to publish.
 const REMOTE_PORT_UDP: u16 = 17_210;
 /// The local port the stcp *visitor* binds, which is where a user connects.
@@ -907,6 +910,120 @@ async fn real_frps_carries_a_tcp_round_trip_over_tls() {
         "bytes reaching the local end"
     );
     assert_eq!(to_work, payload.len() as u64, "bytes leaving the local end");
+
+    client.stop().await;
+    let _ = frps.kill().await;
+}
+
+/// The same login over a websocket transport.
+///
+/// This is the one that proves the framing rather than the JSON: `frps` wraps
+/// the accepted socket with `x/net/websocket`'s server handler, which rejects a
+/// client frame that is not masked and a handshake whose `Sec-WebSocket-Accept`
+/// does not match its key. Getting either wrong is a connection that closes
+/// without an error anyone can read.
+#[tokio::test]
+#[ignore = "needs a real frps: set RUN_REAL_FRPS_TESTS=1, FRPS_BIN and FRPS_CONFIG"]
+async fn real_frps_accepts_a_login_over_websocket() {
+    let Some((bin, config_path)) = frps() else {
+        return;
+    };
+    let mut frps = start(&bin, &config_path);
+    wait_for_port(CONTROL_PORT, Duration::from_secs(10)).await;
+
+    let mut config = client_config();
+    let transport = config.common.transport.as_mut().unwrap();
+    transport.protocol = "websocket".into();
+    // Plain websocket still runs TLS, inside the frames — so turning it off is
+    // what makes this test about the websocket layer alone. The combination
+    // with TLS on is covered separately.
+    transport.tls.as_mut().unwrap().enable = Some(false);
+
+    let session = rust_frpc::client::login(&config, "")
+        .await
+        .expect("login over websocket should succeed");
+    assert_eq!(session.run_id().len(), 16);
+    session.close().await.ok();
+    let _ = frps.kill().await;
+}
+
+/// A `tcp` round trip over websocket, so yamux rides inside the frames.
+///
+/// The payload is past one websocket frame and past the yamux window, which is
+/// where a layer that mishandles either stalls rather than corrupts: framing is
+/// per write, and a reader that treated every frame as a message boundary would
+/// hand yamux fragments instead of a stream.
+#[tokio::test]
+#[ignore = "needs a real frps: set RUN_REAL_FRPS_TESTS=1, FRPS_BIN and FRPS_CONFIG"]
+async fn real_frps_carries_a_tcp_round_trip_over_websocket() {
+    let Some((bin, config_path)) = frps() else {
+        return;
+    };
+    let mut frps = start(&bin, &config_path);
+    wait_for_port(CONTROL_PORT, Duration::from_secs(10)).await;
+
+    let echo_port = start_echo().await;
+    let mut config = client_config_with_proxy(REMOTE_PORT_WS, echo_port);
+    let transport = config.common.transport.as_mut().unwrap();
+    transport.protocol = "websocket".into();
+    transport.tls.as_mut().unwrap().enable = Some(false);
+    let mut client = spawn_client(config);
+
+    let mut user = wait_for_published(REMOTE_PORT_WS, Duration::from_secs(10)).await;
+    let payload: Vec<u8> = (0..40_000u32).map(|i| (i % 251) as u8).collect();
+    user.write_all(&payload).await.expect("write to the proxy");
+    user.flush().await.expect("flush");
+
+    let mut got = vec![0u8; payload.len()];
+    tokio::time::timeout(Duration::from_secs(10), user.read_exact(&mut got))
+        .await
+        .expect("the echo should come back within ten seconds")
+        .expect("read the echo");
+    assert_eq!(got, payload, "the bytes came back changed");
+
+    drop(user);
+    let (to_local, to_work) = client.next_connection(Duration::from_secs(10)).await;
+    assert_eq!(
+        to_local,
+        payload.len() as u64,
+        "bytes reaching the local end"
+    );
+    assert_eq!(to_work, payload.len() as u64, "bytes leaving the local end");
+
+    client.stop().await;
+    let _ = frps.kill().await;
+}
+
+/// Websocket with TLS inside it, which is what a plain `websocket` config asks
+/// for by default.
+///
+/// The layering is the point: the head byte and the TLS records travel *inside*
+/// the websocket stream, and `frps` reads them the same way round because its
+/// socket is already a websocket by then.
+#[tokio::test]
+#[ignore = "needs a real frps: set RUN_REAL_FRPS_TESTS=1, FRPS_BIN and FRPS_CONFIG"]
+async fn real_frps_carries_a_tcp_round_trip_over_websocket_with_tls() {
+    let Some((bin, config_path)) = frps() else {
+        return;
+    };
+    let mut frps = start(&bin, &config_path);
+    wait_for_port(CONTROL_PORT, Duration::from_secs(10)).await;
+
+    let echo_port = start_echo().await;
+    let mut config = client_config_with_proxy(REMOTE_PORT_WS_TLS, echo_port);
+    config.common.transport.as_mut().unwrap().protocol = "websocket".into();
+    let client = spawn_client(config);
+
+    let mut user = wait_for_published(REMOTE_PORT_WS_TLS, Duration::from_secs(10)).await;
+    user.write_all(b"tls inside websocket").await.unwrap();
+    user.flush().await.unwrap();
+
+    let mut got = vec![0u8; 20];
+    tokio::time::timeout(Duration::from_secs(10), user.read_exact(&mut got))
+        .await
+        .expect("the echo should come back within ten seconds")
+        .expect("read the echo");
+    assert_eq!(&got, b"tls inside websocket");
 
     client.stop().await;
     let _ = frps.kill().await;
