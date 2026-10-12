@@ -222,6 +222,8 @@ docs too.
 | `--check-config` | Added | Validate and print the normalized config, then exit. For CI and pre-deploy checks. |
 | `--log-level` | Added | The Go root client has no such flag; it is only on the per-type proxy subcommands. |
 | `log.format = "json"` and `log.color` | Added | For log pipelines. Text stays the default, and is what matches the Go output. |
+| The caller field | Go line for Go messages, Rust line for the rest | A message that reproduces a Go one carries that Go line (`[service.go:332]`), because the field's whole purpose is to lead someone who knows frp back to the source. A message frp never prints carries this implementation's own `[client/udp.rs:88]`, since inventing a Go line for it would be a lie in the one field an operator uses to find their way. |
+| "connect to server error" and "start proxy success" | Go's wording, with the delay or remote address appended | The leading text is what a runbook or a log parser keys on, so it is kept verbatim; the appended value is an addition. |
 | `wireType` | Added | `virtual_net` uses it upstream; nothing else does. Only `tcp` and `udp` are honoured, since announcing a type this side cannot speak would register a proxy that never works. |
 | `quic` transport | Not supported | The Rust QUIC stack costs binary size and build time; `kcp` covers the same weak-network case for now. |
 | YAML and JSON configs | Not supported | Go sniffs all three formats by content; this dispatches legacy-INI versus TOML only. A `.yaml` or `.json` config is read as TOML and fails rather than being misread. |

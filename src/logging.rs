@@ -235,17 +235,58 @@ impl Logger {
 }
 
 /// Emits one record. No-op when the level is filtered out.
+///
+/// The caller field is filled in from this crate's own source rather than left
+/// blank — see [`here`].
+#[track_caller]
 pub fn log(level: Level, message: impl AsRef<str>) {
-    emit(level, "", "", message.as_ref());
+    emit(level, &here(), "", message.as_ref());
 }
 
 /// The same, with the upstream Go caller site attached.
 ///
-/// `caller` is a Go `file:line`, taken from [`CALLERS`]. Passing it explicitly
-/// keeps the map next to the call it describes instead of keyed on line numbers
-/// that every edit would invalidate.
+/// `caller` is a Go `file:line`, taken from [`callers`], for the messages that
+/// deliberately reproduce a Go one. Passing it explicitly keeps the map next to
+/// the call it describes instead of keyed on line numbers that every edit would
+/// invalidate.
 pub fn log_at(level: Level, caller: &str, message: impl AsRef<str>) {
     emit(level, caller, "", message.as_ref());
+}
+
+/// Where in *this* implementation a record came from, as `[file.rs:line]`.
+///
+/// Go's `getCallerPrefix` trims to the last two path components, and the same
+/// trim here gives `[client/service.rs:545]`. That is not a line that exists in
+/// frp, and it does not pretend to be: the messages that reproduce a Go line
+/// carry that line explicitly through [`log_at`], and everything else says where
+/// it really came from. A blank column would be worse than either, because it
+/// reads as a bug in the logger rather than as information.
+#[track_caller]
+fn here() -> String {
+    let location = std::panic::Location::caller();
+    // Normalized to `/` so the field reads like a Go path on every platform;
+    // rustc spells it with the host separator, which on Windows is `\`.
+    let path = trimmed_path(location.file()).replace('\\', "/");
+    format!("[{path}:{}]", location.line())
+}
+
+/// The last two path components, as `trimmedPath` renders them.
+///
+/// Both separators are accepted because `Location::file()` is spelled the way
+/// rustc was invoked, which on Windows is `src\client\service.rs`. Go only ever
+/// sees `/`, so its `LastIndexByte(path, '/')` needs no such care.
+fn trimmed_path(path: &str) -> &str {
+    let is_separator = |c: char| c == '/' || c == '\\';
+    let Some(last) = path.rfind(is_separator) else {
+        return path;
+    };
+    // A file directly under the root keeps both components, matching Go: its
+    // `trimmedPath` falls back to the full path when there is no penultimate
+    // separator.
+    match path[..last].rfind(is_separator) {
+        None => path,
+        Some(second) => &path[second + 1..],
+    }
 }
 
 fn emit(level: Level, caller: &str, prefix: &str, message: &str) {
@@ -284,24 +325,29 @@ impl Prefixed {
         }
     }
 
+    #[track_caller]
     pub fn trace(&self, message: impl AsRef<str>) {
-        self.at(Level::Trace, "", message);
+        emit(Level::Trace, &here(), &self.prefix, message.as_ref());
     }
 
+    #[track_caller]
     pub fn debug(&self, message: impl AsRef<str>) {
-        self.at(Level::Debug, "", message);
+        emit(Level::Debug, &here(), &self.prefix, message.as_ref());
     }
 
+    #[track_caller]
     pub fn info(&self, message: impl AsRef<str>) {
-        self.at(Level::Info, "", message);
+        emit(Level::Info, &here(), &self.prefix, message.as_ref());
     }
 
+    #[track_caller]
     pub fn warn(&self, message: impl AsRef<str>) {
-        self.at(Level::Warn, "", message);
+        emit(Level::Warn, &here(), &self.prefix, message.as_ref());
     }
 
+    #[track_caller]
     pub fn error(&self, message: impl AsRef<str>) {
-        self.at(Level::Error, "", message);
+        emit(Level::Error, &here(), &self.prefix, message.as_ref());
     }
 
     /// The same with an upstream caller site attached.
@@ -310,22 +356,27 @@ impl Prefixed {
     }
 }
 
+#[track_caller]
 pub fn trace(message: impl AsRef<str>) {
     log(Level::Trace, message);
 }
 
+#[track_caller]
 pub fn debug(message: impl AsRef<str>) {
     log(Level::Debug, message);
 }
 
+#[track_caller]
 pub fn info(message: impl AsRef<str>) {
     log(Level::Info, message);
 }
 
+#[track_caller]
 pub fn warn(message: impl AsRef<str>) {
     log(Level::Warn, message);
 }
 
+#[track_caller]
 pub fn error(message: impl AsRef<str>) {
     log(Level::Error, message);
 }
@@ -349,15 +400,33 @@ fn escape_json(input: &str) -> String {
 /// The upstream `file:line` a Rust call site corresponds to.
 ///
 /// Hand-maintained, and deliberately so: the value cannot be derived, and a
-/// stale guess would be worse than none. Add a row when adding a call site —
-/// `[service.go:332]` is what someone who knows frp will search for.
+/// stale guess would be worse than none. Each entry is what Go's own
+/// `getCallerPrefix` would print for that line — its `trimmedPath` keeps the
+/// last two path components, so `cmd/frpc/sub/root.go:194` prints as
+/// `sub/root.go:194` and `client/proxy/proxy_manager.go:183` as
+/// `proxy/proxy_manager.go:183`.
+///
+/// Only messages that reproduce a Go one belong here. Everything else takes the
+/// caller from [`here`], which points at this implementation, because inventing
+/// a Go line for a message frp never prints would be a lie in the one field an
+/// operator uses to find their way back to the source.
 pub mod callers {
-    pub const START: &str = "[root.go:195]";
-    pub const LOGIN_SUCCESS: &str = "[service.go:332]";
+    /// `log.Infof("start frpc service for config file [%s] with aggregated configuration", cfgFile)`
+    pub const START: &str = "[sub/root.go:194]";
+    /// `defer log.Infof("frpc service for config file [%s] stopped", cfgFile)`
+    pub const STOP: &str = "[sub/root.go:195]";
+    /// `xl.Infof("try to connect to server...")`
+    #[allow(dead_code)]
     pub const LOGIN_TRY: &str = "[service.go:312]";
+    /// `xl.Warnf("connect to server error: %v", err)`
     pub const LOGIN_ERROR: &str = "[service.go:323]";
-    pub const PROXY_ADDED: &str = "[proxy_manager.go:183]";
+    /// `xl.Infof("login to server success, get run id [%s]", svr.runID)`
+    pub const LOGIN_SUCCESS: &str = "[service.go:332]";
+    /// `xl.Infof("proxy added: %s", addPxyNames)`
+    pub const PROXY_ADDED: &str = "[proxy/proxy_manager.go:183]";
+    /// `xl.Infof("[%s] start proxy success", proxyName)`
     pub const PROXY_START: &str = "[control.go:174]";
+    /// `xl.Warnf("[%s] start error: %v", proxyName, err)`
     pub const PROXY_START_ERROR: &str = "[control.go:172]";
 }
 
@@ -533,5 +602,28 @@ mod tests {
         assert_eq!(Level::Info.brush(), "\x1b[1;34m");
         assert_eq!(Level::Warn.brush(), "\x1b[1;33m");
         assert_eq!(Level::Error.brush(), "\x1b[1;31m");
+    }
+
+    /// `trimmedPath` keeps the last two components and no more.
+    #[test]
+    fn a_caller_path_keeps_the_last_two_components() {
+        assert_eq!(trimmed_path("src/client/service.rs"), "client/service.rs");
+        assert_eq!(trimmed_path("a/b/c/d/e.rs"), "d/e.rs");
+        // One separator or none is already two components or fewer, so Go
+        // returns the whole path and so does this.
+        assert_eq!(trimmed_path("src/lib.rs"), "src/lib.rs");
+        assert_eq!(trimmed_path("lib.rs"), "lib.rs");
+    }
+
+    /// rustc spells `file!()` with the host separator, so Windows needs the
+    /// same trim; the field is normalized to `/` on the way out.
+    #[test]
+    fn a_windows_caller_path_trims_the_same_way() {
+        assert_eq!(trimmed_path(r"src\client\service.rs"), r"client\service.rs");
+        assert_eq!(trimmed_path(r"src\lib.rs"), r"src\lib.rs");
+        assert_eq!(
+            trimmed_path(r"src\client\service.rs").replace('\\', "/"),
+            "client/service.rs"
+        );
     }
 }

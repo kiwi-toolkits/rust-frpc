@@ -250,9 +250,15 @@ async fn serve(
                     return Err(err);
                 }
                 let delay = first_login_backoff.next(true);
-                logging::warn(format!(
-                    "login to the server failed ({err}), retrying in {delay:?}"
-                ));
+                // Go's wording, with the delay appended: `connect to server
+                // error:` is what a runbook or a log parser is keyed on, and
+                // dropping it to say something more descriptive would break
+                // that for no gain. The delay is the addition.
+                logging::log_at(
+                    logging::Level::Warn,
+                    logging::callers::LOGIN_ERROR,
+                    format!("connect to server error: {err}, retrying in {delay:?}"),
+                );
                 if !sleep_or_shutdown(delay, &mut stop_rx).await {
                     return Ok(());
                 }
@@ -333,7 +339,19 @@ async fn serve(
 
         match outcome {
             SessionEnd::Stopped => {
-                logging::info("client stopped");
+                // Go reaches this through a `defer` in
+                // `startServiceWithAggregator`, so it prints whether the client
+                // was stopped by a signal or by the admin API.
+                let message = match config_path
+                    .as_ref()
+                    .filter(|path| !path.as_os_str().is_empty())
+                {
+                    Some(path) => {
+                        format!("frpc service for config file [{}] stopped", path.display())
+                    }
+                    None => "frpc service stopped".to_string(),
+                };
+                logging::log_at(logging::Level::Info, logging::callers::STOP, message);
                 return Ok(());
             }
             SessionEnd::Reload => {
@@ -414,7 +432,11 @@ async fn login_again(
                     return Err(err);
                 }
                 let delay = backoff.next(true);
-                logging::warn(format!("reconnect failed: {err}, retrying in {delay:?}"));
+                logging::log_at(
+                    logging::Level::Warn,
+                    logging::callers::LOGIN_ERROR,
+                    format!("connect to server error: {err}, retrying in {delay:?}"),
+                );
                 if !sleep_or_shutdown(delay, shutdown).await {
                     return Ok(());
                 }

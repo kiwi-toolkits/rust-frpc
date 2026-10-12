@@ -4,11 +4,21 @@
 
 * **Log output matches `golib` line for line.** `2006-01-02 15:04:05.000 [I]
   [service.go:332] [runID] …` — the fixed-width local timestamp, the one-letter
-  level, the upstream Go caller site from a hand-maintained map, and the run-id
-  and proxy-name prefixes. The previous format used RFC3339, spelled the level
-  `[INFO]`, and carried neither of the last two; the module comment claiming it
-  was "line-for-line the same as the Go client's" was quoting a format that
-  appears nowhere in frp or golib.
+  level, the caller, and the run-id and proxy-name prefixes. The previous format
+  used RFC3339, spelled the level `[INFO]`, and carried neither the caller nor
+  the prefixes; the module comment claiming it was "line-for-line the same as the
+  Go client's" was quoting a format that appears nowhere in frp or golib.
+* **Every line carries a caller, and the Go-mirroring ones carry the *Go* line.**
+  The public log functions take their location from `#[track_caller]`, so a
+  message frp never prints says where in this implementation it came from
+  (`[client/udp.rs:88]`) instead of leaving a blank column that reads as a logger
+  bug. The messages that do reproduce a Go one name that Go line explicitly —
+  `[sub/root.go:194]`, `[service.go:332]`, `[proxy/proxy_manager.go:183]`,
+  `[control.go:174]` — because the field's whole purpose is to lead someone who
+  knows frp back to the source, and a Rust line number there would send them
+  nowhere. `connect to server error:` and the shutdown line now use Go's wording
+  as well, with the backoff delay and the config path appended where this client
+  has something extra to say.
 * **`log.to` writes a file, and `log.maxDays` rotates it.** All three of
   `log.to`, `log.maxDays` and `log.disablePrintColor` were parsed and then
   ignored, so `log.to = "./frpc.log"` — the value the shipped Go example uses —
