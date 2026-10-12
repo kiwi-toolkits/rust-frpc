@@ -148,9 +148,23 @@ pub async fn start_all(
         let user = config.common.user.clone();
         let traffic = traffic.clone();
         let name = visitor.name.clone();
+        // A `sudp` visitor reads its local socket through `udpPacketSize`, the
+        // same buffer `ForwardUserConn` is handed on the Go side.
+        let packet_size =
+            crate::client::udp::PacketSize::from_config(config.common.udp_packet_size);
 
         tasks.spawn(async move {
-            if let Err(err) = run(visitor, connector, codec, run_id, user, traffic).await {
+            if let Err(err) = run(
+                visitor,
+                connector,
+                codec,
+                run_id,
+                user,
+                packet_size,
+                traffic,
+            )
+            .await
+            {
                 logging::warn(format!("visitor {name}: {err}"));
             }
         });
@@ -196,6 +210,7 @@ async fn run(
     codec: Codec,
     run_id: String,
     user: String,
+    packet_size: crate::client::udp::PacketSize,
     traffic: Arc<Traffic>,
 ) -> Result<()> {
     if visitor.use_compression {
@@ -218,7 +233,17 @@ async fn run(
         naming::build_target_server_proxy_name(&user, &visitor.server_user, &visitor.server_name);
 
     if visitor.kind == "sudp" {
-        return run_udp(visitor, connector, codec, run_id, target, addr, traffic).await;
+        return run_udp(
+            visitor,
+            connector,
+            codec,
+            run_id,
+            target,
+            addr,
+            packet_size,
+            traffic,
+        )
+        .await;
     }
 
     let listener = TcpListener::bind(&addr).await.map_err(|err| {
@@ -288,6 +313,7 @@ async fn run(
 /// same window the Go visitor gets from a 30-second read deadline on the visitor
 /// connection, and the next datagram opens a fresh one. The bound socket is never
 /// dropped, so from the outside a session ending is invisible.
+#[allow(clippy::too_many_arguments)]
 async fn run_udp(
     visitor: Visitor,
     connector: Connector,
@@ -295,6 +321,7 @@ async fn run_udp(
     run_id: String,
     target: String,
     addr: String,
+    packet_size: crate::client::udp::PacketSize,
     traffic: Arc<Traffic>,
 ) -> Result<()> {
     let local = tokio::net::UdpSocket::bind(&addr).await.map_err(|err| {
@@ -308,6 +335,8 @@ async fn run_udp(
         visitor.name
     ));
 
+    // Read at full size and trim afterwards, so the cut `udpPacketSize` asks
+    // for is the same on every platform. See `udp::PacketSize`.
     let mut datagram = vec![0u8; crate::client::udp::MAX_DATAGRAM];
     loop {
         // Whoever's datagram this is, it opens a session if there is not one
@@ -315,7 +344,7 @@ async fn run_udp(
         let Ok((read, user)) = local.recv_from(&mut datagram).await else {
             return Ok(());
         };
-        let first = datagram[..read].to_vec();
+        let first = datagram[..read.min(packet_size.get())].to_vec();
 
         if let Err(err) = udp_session(
             &connector,
@@ -327,6 +356,7 @@ async fn run_udp(
             first,
             &local,
             user,
+            packet_size,
             &visitor.name,
             &traffic,
         )
@@ -353,6 +383,7 @@ async fn udp_session(
     first_datagram: Vec<u8>,
     local: &tokio::net::UdpSocket,
     user: std::net::SocketAddr,
+    packet_size: crate::client::udp::PacketSize,
     visitor_name: &str,
     traffic: &Traffic,
 ) -> Result<()> {
@@ -408,9 +439,27 @@ async fn udp_session(
     // different secret.
     if use_encryption {
         let conn = CryptoStream::encrypted(conn, secret_key.as_bytes());
-        relay(conn, codec, local, first, visitor_name, traffic).await
+        relay(
+            conn,
+            codec,
+            local,
+            first,
+            packet_size,
+            visitor_name,
+            traffic,
+        )
+        .await
     } else {
-        relay(conn, codec, local, first, visitor_name, traffic).await
+        relay(
+            conn,
+            codec,
+            local,
+            first,
+            packet_size,
+            visitor_name,
+            traffic,
+        )
+        .await
     }
 }
 
@@ -426,6 +475,7 @@ async fn relay<S>(
     codec: Codec,
     local: &tokio::net::UdpSocket,
     first: Message,
+    packet_size: crate::client::udp::PacketSize,
     visitor_name: &str,
     traffic: &Traffic,
 ) -> Result<()>
@@ -435,6 +485,7 @@ where
     let (mut reader, mut writer) = tokio::io::split(conn);
     codec.write(&mut writer, &first).await?;
 
+    // Full size; the cut is applied to what is forwarded. See `udp::PacketSize`.
     let mut datagram = vec![0u8; crate::client::udp::MAX_DATAGRAM];
     // Restarted whenever anything moves in either direction, so a session lives as
     // long as the conversation does — the same rule as the Go visitor's 30-second
@@ -484,7 +535,7 @@ where
             // limitation.
             read = local.recv_from(&mut datagram) => {
                 let Ok((read, from)) = read else { continue };
-                let content = datagram[..read].to_vec();
+                let content = datagram[..read.min(packet_size.get())].to_vec();
                 traffic.record(content.len() as u64, 0);
                 codec
                     .write(

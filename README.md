@@ -100,6 +100,12 @@ from a half-parsed file: an unreadable config is logged and ignored.
   A `sudp` session belongs to the visitor rather than to a user: the first datagram
   opens it, later datagrams from any user ride on it, and each carries the address
   it came from, which is how the answer gets back to the right one.
+* `udpPacketSize` is honoured, and it is the length a datagram is *cut to* rather
+  than the size of a buffer: a 2 000-byte reply from a local service arrives as
+  1 500 bytes under the default, in this client and in Go's alike. A value outside
+  `1..=65507` is clamped with a warning instead of obeyed, since Go's `0` reads
+  every datagram as empty. `doc/compatibility.md` records the other liberty taken
+  with it.
 * A proxy whose local side this client cannot run — `xtcp`, an unimplemented
   plugin, or a `wireType` it does not speak — is reported and skipped, so one of
   them does not cost you the other tunnels in the file. `--check-config` says the

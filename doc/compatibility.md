@@ -213,7 +213,7 @@ docs too.
 | Plugins | None, yet | A config naming one is reported and that proxy is skipped, so the rest of the file still runs. |
 | Visitors | `stcp` and `sudp`, from TOML and legacy INI alike | `xtcp` needs NAT hole punching, and a config naming it is skipped with a warning rather than half-run. |
 | Health checks | Parsed, not run | `healthCheck` is accepted and the proxy still registers, but nothing polls it, so an unhealthy backend is never withdrawn. |
-| `udpPacketSize` | Parsed, not honoured | The client's buffer is the protocol ceiling (65507) rather than the configured value, which only ever makes the client accept more than it was told to. |
+| `udpPacketSize` | Honoured, and clamped | It is the length a datagram is cut to, not an allocation hint: a 2000-byte reply arrives as 1500 bytes under the default, in both clients. Two liberties. A value outside `1..=65507` is clamped rather than obeyed, because Go's zero reads every datagram as empty and its negative panics. And the cut happens after the read rather than by it, because a short `recvfrom` on Windows fails with `WSAEMSGSIZE` and the Go forwarder treats a read error as the end of that user's socket — the datagram is lost, not shortened. |
 | `dnsServer`, `natHoleStunServer`, `store`, `webServer.assetsDir`, `webServer.pprofEnable`, OIDC | Parsed, not used | Each is reported rather than silently dropped. `auth.method = "oidc"` validates but then authenticates with the token. |
 | `renameOnConflict` | Parsed, not applied | The `ex_1_ → ex_2_ → ex_3_` sequence is implemented against `rust-tiny-frpc`, but turning it on changes a proxy's public name, so it stays off until asked for. |
 | Wire protocol | v1 only | The v2 framing is implemented and tested, but the `ClientHello`/`ServerHello` exchange is not, so a `v2` config cannot complete a session. |
@@ -228,4 +228,3 @@ docs too.
 | `quic` transport | Not supported | The Rust QUIC stack costs binary size and build time; `kcp` covers the same weak-network case for now. |
 | YAML and JSON configs | Not supported | Go sniffs all three formats by content; this dispatches legacy-INI versus TOML only. A `.yaml` or `.json` config is read as TOML and fails rather than being misread. |
 | Version string | `rust-frpc.<version>` | `frps` logs it and the dashboard shows it, so an operator can tell which client is which. No compatibility impact. |
-| Rename retry | Parsed, not yet applied | Same `ex_1_ → ex_2_ → ex_3_` sequence as `rust-tiny-frpc`. Turning it on changes a proxy's public name, so it should be a decision — and it is off by default. |

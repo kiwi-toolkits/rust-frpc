@@ -48,6 +48,24 @@ impl std::fmt::Display for ValidationIssue {
 pub fn validate(config: &ClientConfig) -> Result<Vec<ValidationIssue>> {
     let mut issues = Vec::new();
 
+    // `udpPacketSize` is the buffer a UDP socket is read into, so a value out of
+    // range is clamped at use rather than obeyed — see `client::udp::PacketSize`.
+    // Go does not clamp and a zero there gives a zero-length buffer that reads
+    // every datagram as empty. Saying so is the least this can do, since the
+    // operator asked for a number and is getting another one.
+    if crate::client::udp::PacketSize::was_clamped(config.common.udp_packet_size) {
+        issues.push(warning(
+            "udpPacketSize",
+            format!(
+                "{} is outside 1..={}; using {} instead. It is the buffer a UDP socket is \
+                 read into, so a datagram longer than it is truncated.",
+                config.common.udp_packet_size,
+                crate::client::udp::MAX_DATAGRAM,
+                crate::client::udp::PacketSize::from_config(config.common.udp_packet_size).get(),
+            ),
+        ));
+    }
+
     if let Some(transport) = config.common.transport.as_ref() {
         if !SUPPORTED_TRANSPORT_PROTOCOLS.contains(&transport.protocol.as_str()) {
             issues.push(error(
@@ -330,6 +348,36 @@ mod tests {
     fn a_minimal_config_validates_cleanly() {
         let config = config_with_proxy(ProxyKind::Tcp { remote_port: 6000 });
         assert!(errors(&config).is_empty(), "{:?}", errors(&config));
+    }
+
+    /// `udpPacketSize` is clamped at use, so an out-of-range value has to say so
+    /// — otherwise the operator sets one number and gets another.
+    #[test]
+    fn an_out_of_range_packet_size_is_reported_as_a_warning() {
+        let mut config = config_with_proxy(ProxyKind::Udp { remote_port: 6000 });
+        config.common.udp_packet_size = 0;
+        let issues = validate(&config).unwrap();
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.severity == Severity::Warning
+                    && issue.message.contains("outside 1..=65507")),
+            "{issues:?}"
+        );
+        // A warning, not an error: the client still runs, on a sane buffer.
+        assert!(errors(&config).is_empty());
+    }
+
+    #[test]
+    fn a_packet_size_in_range_is_not_reported() {
+        let mut config = config_with_proxy(ProxyKind::Udp { remote_port: 6000 });
+        for size in [1, 1500, 9000, crate::client::udp::MAX_DATAGRAM as i64] {
+            config.common.udp_packet_size = size;
+            assert!(
+                validate(&config).unwrap().is_empty(),
+                "{size} should not be reported"
+            );
+        }
     }
 
     #[test]

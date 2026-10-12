@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+* **`udpPacketSize` is now the length a datagram is cut to.** It was parsed and
+  then ignored, with every UDP socket read through a 65 507-byte buffer — the
+  protocol ceiling rather than the configured value, so a local service answering
+  a 2 000-byte reply had all 2 000 bytes delivered where the Go client delivers
+  1 500. `pool.GetBuf(size)` hands the Go forwarder a slice of exactly that
+  length, which makes this a truncation point rather than an allocation hint, and
+  both places the Go client applies it are now applied here: a reply from a local
+  service in a `udp` or `sudp` proxy, and a user's datagram at a `sudp` visitor's
+  socket. Two liberties are taken with the value, and both are documented in
+  `doc/compatibility.md`. A setting outside `1..=65507` is clamped and reported as
+  a validation warning rather than obeyed, because Go's zero gives a zero-length
+  read buffer — every datagram reads as empty, so the tunnel looks healthy and
+  carries nothing — and a negative one panics in the allocator. And the cut is
+  applied *after* the read rather than by it: on Unix a short `recvfrom`
+  truncates silently, but on Windows it fails with `WSAEMSGSIZE`, and the Go
+  forwarder treats a read error as the end of that user's goroutine — the socket
+  is closed and the datagram lost rather than shortened. A real-`frps` test
+  (`real_frps_truncates_a_udp_reply_to_udp_packet_size`) sends a 500-byte reply
+  through a 64-byte setting and asserts it arrives 64 bytes long; it fails
+  against the code without the trim.
 * **Log output matches `golib` line for line.** `2006-01-02 15:04:05.000 [I]
   [service.go:332] [runID] …` — the fixed-width local timestamp, the one-letter
   level, the caller, and the run-id and proxy-name prefixes. The previous format
@@ -101,6 +121,13 @@
 * Removing a leaked process when a memory measurement fails: the harness now
   kills the client on every path, so a failed gate does not leave an eight-megabyte
   process holding the fixture ports.
+* **`the_full_legacy_ini_example_parses` was asserting a report that had stopped
+  being true.** When `stcp` visitors started working, `[secret_tcp_visitor]`
+  stopped being skipped — and the test still required the warning to name it, so
+  two of that test's three assertions could not hold at once and the suite was red
+  on the committed tree. It now checks both halves: the `xtcp` visitor is the one
+  reported, and the `stcp` visitor is converted, with its kind, bind address and
+  port asserted.
 
 ## 0.1.0 — unreleased
 
@@ -202,8 +229,6 @@ effect.
   registers and runs: `tcp`, `udp`, `http`, `https`, `tcpmux`, `stcp` and `sudp`.
 * Health checks. A `healthCheck` proxy registers and is never withdrawn, because
   nothing polls it.
-* `udpPacketSize`, which is accepted but not applied; the client's buffer is the
-  protocol ceiling.
 * `dnsServer`, `natHoleStunServer`, `store`, `webServer.assetsDir`,
   `webServer.pprofEnable`, and OIDC authentication. `auth.method = "oidc"`
   validates and then authenticates with the token.

@@ -50,13 +50,64 @@ use super::control::{self, Traffic};
 /// other side.
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The largest datagram accepted from a local service.
+/// The ceiling for a UDP payload, and the cap on `udpPacketSize`.
 ///
-/// A UDP payload over IPv4 cannot exceed 65507 bytes, so this is the ceiling
-/// rather than a tuning knob. `udpPacketSize` is the buffer the *server* reads
-/// into and is deliberately not mirrored: a datagram larger than it has already
-/// been dropped by the time it matters here.
+/// A datagram over IPv4 cannot exceed 65507 bytes, so nothing above this is
+/// reachable. The size actually used to read a socket is
+/// [`PacketSize`], which defaults well below this.
 pub const MAX_DATAGRAM: usize = 65_507;
+
+/// How large a datagram may be: `udpPacketSize`.
+///
+/// **This is a truncation point, not an allocation hint.** A datagram longer
+/// than this is cut to it and the excess discarded, which is what Go gets from
+/// `pool.GetBuf(size)` handing `Forwarder` and `ForwardUserConn` a slice of
+/// exactly that length. A 2000-byte reply from a local service arrives as 1500
+/// bytes under the default, in both clients.
+///
+/// The cut is applied *after* the read rather than by the read. Reading straight
+/// into a short buffer would be equivalent on Unix, where `recvfrom` truncates
+/// silently — but on Windows it fails with `WSAEMSGSIZE`, and Go's forwarder
+/// treats any read error as the end of that user's goroutine: the socket is
+/// closed, the map entry dropped, and the datagram lost. Trimming afterwards
+/// gives the same result on both platforms and never costs a mapping.
+///
+/// Two places on this side read through it, matching Go's:
+///
+/// * a reply from a local service, in a `udp` or `sudp` proxy's forwarder;
+/// * a datagram from a user, at a `sudp` visitor's local socket.
+///
+/// A value outside `1..=MAX_DATAGRAM` is clamped. Go does not clamp, and a zero
+/// there produces a zero-length buffer that reads every datagram as empty —
+/// tunnels that look healthy and carry nothing. Refusing to reproduce that is
+/// the other liberty taken with this option.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PacketSize(usize);
+
+impl PacketSize {
+    /// Clamps a configured value, which is `int64` on the Go side and so can be
+    /// negative or absurd.
+    pub fn from_config(configured: i64) -> Self {
+        Self(configured.clamp(1, MAX_DATAGRAM as i64) as usize)
+    }
+
+    pub fn get(self) -> usize {
+        self.0
+    }
+
+    /// Whether [`from_config`](Self::from_config) had to change the value, so
+    /// the caller can say so rather than letting it pass unnoticed.
+    pub fn was_clamped(configured: i64) -> bool {
+        !(1..=MAX_DATAGRAM as i64).contains(&configured)
+    }
+}
+
+impl Default for PacketSize {
+    /// `udpPacketSize`'s default, from `Common.Complete()`.
+    fn default() -> Self {
+        Self(1500)
+    }
+}
 
 /// How often the local sockets are polled for a reply.
 ///
@@ -82,9 +133,10 @@ pub async fn serve(
     codec: Codec,
     name: &str,
     upstream: Upstream,
+    packet_size: PacketSize,
     traffic: Arc<Traffic>,
 ) {
-    if let Err(err) = run(conn, codec, name, upstream, traffic).await {
+    if let Err(err) = run(conn, codec, name, upstream, packet_size, traffic).await {
         logging::debug(format!("proxy {name}: udp work connection ended: {err}"));
     }
 }
@@ -101,6 +153,7 @@ async fn run(
     codec: Codec,
     name: &str,
     upstream: Upstream,
+    packet_size: PacketSize,
     traffic: Arc<Traffic>,
 ) -> Result<()> {
     let (mut reader, mut writer) = tokio::io::split(conn);
@@ -131,6 +184,8 @@ async fn run(
     drain.tick().await;
 
     let mut peers: HashMap<SocketAddr, Peer> = HashMap::new();
+    // Read at full size and trim afterwards: `udpPacketSize` is the length a
+    // datagram is cut to, not the length of this buffer. See `PacketSize`.
     let mut datagram = vec![0u8; MAX_DATAGRAM];
 
     loop {
@@ -240,7 +295,10 @@ async fn run(
                         match peer.socket.try_recv(&mut datagram) {
                             Ok(read) => {
                                 peer.touched = Instant::now();
-                                let content = datagram[..read].to_vec();
+                                // A reply longer than the configured packet size
+                                // is cut here, which is the whole effect of
+                                // `udpPacketSize`.
+                                let content = datagram[..read.min(packet_size.get())].to_vec();
                                 traffic.record(0, content.len() as u64);
                                 let packet = Message::UdpPacket(Box::new(UdpPacket {
                                     content: content.into(),
@@ -372,5 +430,42 @@ mod tests {
         // wrong user.
         let json = r#"{"IP":"example.com","Port":5000,"Zone":""}"#;
         assert!(serde_json::from_str::<UdpAddr>(json).is_err());
+    }
+
+    #[test]
+    fn the_packet_size_default_matches_the_go_client() {
+        assert_eq!(PacketSize::default().get(), 1500);
+        assert!(!PacketSize::was_clamped(1500));
+    }
+
+    #[test]
+    fn a_packet_size_inside_the_range_is_used_as_given() {
+        assert_eq!(PacketSize::from_config(1).get(), 1);
+        assert_eq!(PacketSize::from_config(9000).get(), 9000);
+        assert_eq!(
+            PacketSize::from_config(MAX_DATAGRAM as i64).get(),
+            MAX_DATAGRAM
+        );
+        assert!(!PacketSize::was_clamped(9000));
+    }
+
+    /// Out-of-range values are clamped, and the caller is told.
+    ///
+    /// Go does not clamp: `pool.GetBuf(0)` returns a zero-length slice, and
+    /// every `ReadFromUDP` into it reports an empty datagram — a tunnel that
+    /// looks healthy and carries nothing. A negative one panics inside the
+    /// allocation. Neither is worth reproducing.
+    #[test]
+    fn an_out_of_range_packet_size_is_clamped_and_reported() {
+        assert_eq!(PacketSize::from_config(0).get(), 1);
+        assert_eq!(PacketSize::from_config(-1).get(), 1);
+        assert_eq!(
+            PacketSize::from_config(MAX_DATAGRAM as i64 + 1).get(),
+            MAX_DATAGRAM
+        );
+
+        assert!(PacketSize::was_clamped(0));
+        assert!(PacketSize::was_clamped(-5));
+        assert!(PacketSize::was_clamped(i64::MAX));
     }
 }

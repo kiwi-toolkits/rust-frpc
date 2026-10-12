@@ -91,6 +91,10 @@ curl localhost:7400/metrics  # 纯文本计数器
 * legacy INI 里 `role = visitor` 的段会真正转换成 visitor 并启动（`stcp`/`sudp`），只有
   `xtcp` 会被记录并跳过。未指定 `bindAddr` 的 visitor 默认 `127.0.0.1`，与
   `CompleteVisitorConfigurers` 一致——否则空主机名会把端口绑到所有网卡上。
+* `udpPacketSize` 已生效，它的含义是**数据报被截断到的长度**，而不是缓冲区大小：本地服务回一个
+  2000 字节的应答，在默认值下到达时是 1500 字节——本客户端与 go 版行为一致。取值超出
+  `1..=65507` 会被夹紧并给出警告，而不是照办：go 版的 `0` 会把每个数据报都读成空的。
+  另一处有意为之的差异记在 `doc/compatibility.md`。
 * 本地侧跑不了的代理（`xtcp`、未实现的插件、或本客户端不支持的 `wireType`）会被记录并跳过，
   不会因为其中一个而让配置文件里的其它隧道一起失效。`--check-config` 在部署前就会给出同样的提示。
 * 日志与 `golib` 对齐：`2006-01-02 15:04:05.000 [I] [service.go:332] [runID] …`，级别是单字母，

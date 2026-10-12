@@ -657,12 +657,22 @@ impl Control {
         let user = self.config.common.user.clone();
         let signed = signs_new_work_conns(&self.config);
         let secret = self.token();
+        let packet_size = self.packet_size();
         let events = events.clone();
         let traffic = self.traffic.clone();
 
         tokio::spawn(async move {
             let result = open_work_conn(
-                codec, connector, run_id, proxies, &user, signed, secret, events, traffic,
+                codec,
+                connector,
+                run_id,
+                proxies,
+                &user,
+                signed,
+                secret,
+                packet_size,
+                events,
+                traffic,
             )
             .await;
             if let Err(err) = result {
@@ -709,6 +719,15 @@ impl Control {
             .map(|seconds| Duration::from_secs(seconds as u64))
     }
 
+    /// `udpPacketSize`, clamped to a length that can actually read a datagram.
+    ///
+    /// Clamped here rather than trusted because Go does not clamp and a zero
+    /// from the config file gives a zero-length read buffer there — every
+    /// datagram reads as empty, so the tunnel looks healthy and carries nothing.
+    fn packet_size(&self) -> crate::client::udp::PacketSize {
+        crate::client::udp::PacketSize::from_config(self.config.common.udp_packet_size)
+    }
+
     fn token(&self) -> String {
         self.config
             .common
@@ -743,6 +762,7 @@ async fn open_work_conn(
     user: &str,
     signed: bool,
     secret: String,
+    packet_size: crate::client::udp::PacketSize,
     events: Option<mpsc::Sender<ControlEvent>>,
     traffic: Arc<Traffic>,
 ) -> Result<()> {
@@ -821,7 +841,7 @@ async fn open_work_conn(
             local_port: proxy.qos().local_port,
         };
         tokio::spawn(async move {
-            crate::client::udp::serve(conn, codec, &name, upstream, traffic).await;
+            crate::client::udp::serve(conn, codec, &name, upstream, packet_size, traffic).await;
         });
         return Ok(());
     }

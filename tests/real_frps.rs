@@ -258,6 +258,17 @@ fn client_config_with_udp_proxy(remote_port: u16, local_port: u16) -> config::Cl
     config
 }
 
+/// The same, with `udpPacketSize` set to a value small enough to truncate.
+fn client_config_with_small_udp_buffers(
+    remote_port: u16,
+    local_port: u16,
+    packet_size: i64,
+) -> config::ClientConfig {
+    let mut config = client_config_with_udp_proxy(remote_port, local_port);
+    config.common.udp_packet_size = packet_size;
+    config
+}
+
 /// An `stcp` proxy, and nothing else: no public port, no visitor.
 fn client_config_with_stcp_proxy(local_port: u16) -> config::ClientConfig {
     let mut config = client_config();
@@ -958,6 +969,60 @@ async fn real_frps_carries_a_udp_round_trip() {
     let reply = udp_round_trip(target, &payload).await;
     assert_eq!(&reply[..5], b"echo:");
     assert_eq!(&reply[5..], &payload[..]);
+
+    client.stop().await;
+    let _ = frps.kill().await;
+}
+
+/// `udpPacketSize` truncates the local service's reply.
+///
+/// The option is a read-buffer length, not an allocation hint: `pool.GetBuf(size)`
+/// hands the Go forwarder a slice of exactly that length, and a datagram longer
+/// than it is truncated with the excess discarded. So this is not testing that
+/// the value is *remembered* — it is testing the only thing it does.
+#[tokio::test]
+#[ignore = "needs a real frps: set RUN_REAL_FRPS_TESTS=1, FRPS_BIN and FRPS_CONFIG"]
+async fn real_frps_truncates_a_udp_reply_to_udp_packet_size() {
+    let Some((bin, config_path)) = frps() else {
+        return;
+    };
+    let mut frps = start(&bin, &config_path);
+    wait_for_port(CONTROL_PORT, Duration::from_secs(10)).await;
+
+    const PACKET_SIZE: i64 = 64;
+    let echo_port = start_udp_echo().await;
+    let client = spawn_client(client_config_with_small_udp_buffers(
+        REMOTE_PORT_UDP,
+        echo_port,
+        PACKET_SIZE,
+    ));
+
+    // The service answers with `echo:` plus the request, so a request this long
+    // makes a reply that cannot fit.
+    let payload: Vec<u8> = (0..500u32).map(|i| (i % 251) as u8).collect();
+    let target: std::net::SocketAddr = format!("127.0.0.1:{REMOTE_PORT_UDP}").parse().unwrap();
+
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut buf = vec![0u8; 4096];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let read = loop {
+        socket.send_to(&payload, target).await.unwrap();
+        match tokio::time::timeout(Duration::from_millis(250), socket.recv_from(&mut buf)).await {
+            Ok(Ok((read, _))) => break read,
+            _ => assert!(
+                tokio::time::Instant::now() < deadline,
+                "the proxy never answered"
+            ),
+        }
+    };
+
+    // Truncated at the buffer, not at the datagram.
+    assert_eq!(
+        read, PACKET_SIZE as usize,
+        "the reply should be cut at {PACKET_SIZE}"
+    );
+    assert_eq!(&buf[..5], b"echo:");
+    assert_eq!(&buf[5..read], &payload[..read - 5]);
 
     client.stop().await;
     let _ = frps.kill().await;

@@ -9,7 +9,7 @@
 
 use std::path::PathBuf;
 
-use rust_frpc::config::{self, ConfigFormat, ProxyKind, Severity};
+use rust_frpc::config::{self, ConfigFormat, ProxyKind, Severity, VisitorKind};
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -109,10 +109,33 @@ fn the_full_legacy_ini_example_parses() {
         "range:udp_port did not expand: {names:?}"
     );
 
-    // The visitors are understood but not implemented, so they must be reported.
+    // `secret_tcp_visitor` is an `stcp` visitor, which this client runs, so the
+    // section becomes a visitor. `p2p_tcp_visitor` is `xtcp`, which it does not,
+    // so that one is the whole of what gets reported.
     assert_eq!(loaded.warnings.len(), 1, "{:?}", loaded.warnings);
-    assert!(loaded.warnings[0].contains("secret_tcp_visitor"));
-    assert!(loaded.warnings[0].contains("p2p_tcp_visitor"));
+    assert!(
+        loaded.warnings[0].contains("p2p_tcp_visitor"),
+        "{:?}",
+        loaded.warnings
+    );
+    assert!(
+        !loaded.warnings[0].contains("secret_tcp_visitor"),
+        "an stcp visitor runs, so it must not be reported as unsupported: {:?}",
+        loaded.warnings
+    );
+
+    let visitors: Vec<&str> = config
+        .visitors
+        .iter()
+        .map(|visitor| visitor.name.as_str())
+        .collect();
+    assert_eq!(visitors, vec!["secret_tcp_visitor"]);
+    match &config.visitors[0].kind {
+        VisitorKind::Stcp {} => {}
+        other => panic!("secret_tcp_visitor should be stcp, got {other:?}"),
+    }
+    assert_eq!(config.visitors[0].bind_addr, "127.0.0.1");
+    assert_eq!(config.visitors[0].bind_port, 9000);
 
     // Spot-check that the tricky INI conversions landed.
     let ssh = config
