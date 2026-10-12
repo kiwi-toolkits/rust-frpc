@@ -2,6 +2,47 @@
 
 ## Unreleased
 
+* **TLS on the control connection, which is the default path.** `transport.tls`
+  was parsed and then ignored, and every dial was a plain TCP socket — so a
+  server with `transport.tls.force = true` was simply unreachable, and every
+  other deployment silently ran unencrypted at the transport layer while the
+  config said otherwise. The client now builds the same stack of layers the Go
+  client does, from the same options: `transport.tls.enable` (**true** by
+  default), `serverName` (falling back to `serverAddr`), `certFile`/`keyFile`,
+  `trustedCaFile`, and `disableCustomTLSFirstByte`. Two of those are easy to get
+  backwards. The `0x17` head byte is written only when
+  `disableCustomTLSFirstByte` is explicitly **false** — the option defaults to
+  true, meaning the byte is *not* sent — and it is written *before* the
+  handshake, which is the order the Go hooks run in. And verification is **off**
+  unless `trustedCaFile` is set, which is Go's `InsecureSkipVerify = true`; the
+  handshake and the transcript signature are still real, it is the chain and the
+  name that are not checked. `AcceptAnyServerCert` therefore delegates
+  `verify_tls12_signature`/`verify_tls13_signature` to the provider rather than
+  stubbing them out.
+* **The yamux session is generic over its socket.** It took a `TcpStream` and
+  called `into_split()`, which only `TcpStream` has; it now takes anything
+  `AsyncRead + AsyncWrite + Unpin + Send` and splits it with `tokio::io::split`.
+  Nothing about multiplexing cares whether the bytes come out of a socket or a
+  TLS record layer, and this is what makes TLS work with `tcpMux` on — which is
+  the default combination.
+* **Three new real-`frps` tests, one of which a plain-TCP client cannot pass.**
+  `frps-integration-tls.toml` sets `transport.tls.force = true`, so the server
+  rejects anything that is not a TLS handshake outright. `real_frps_accepts_a_login_over_tls`
+  logs in against it, `real_frps_refuses_a_plain_login_to_a_tls_server` pins the
+  other direction (a client that ignored `enable = false` and always spoke TLS
+  would pass the first test alone), and `real_frps_carries_a_tcp_round_trip_over_tls`
+  drives 40 KB through the whole stack — yamux inside a TLS session, every work
+  connection and the bridge. The other twenty tests now dial TLS as well, since
+  that is what the default config asks for.
+* **`udp_round_trip` in the integration suite was a spinner, not a wait.** It
+  retried 40 times, but on Windows a datagram to a closed UDP port draws an ICMP
+  unreachable and the *next* read of that socket fails immediately — so the
+  forty attempts completed in about as many microseconds and the loop gave up on
+  a condition that would have cleared a moment later. It is now bounded by a
+  ten-second deadline with a 50 ms pause between attempts, and it reports how
+  many it made and what the last failure was. This is the defect behind the one
+  test failure seen in fourteen full runs of the suite that could not be
+  reproduced in twenty-five runs of the test on its own.
 * **`udpPacketSize` is now the length a datagram is cut to.** It was parsed and
   then ignored, with every UDP socket read through a 65 507-byte buffer — the
   protocol ceiling rather than the configured value, so a local service answering
@@ -137,10 +178,12 @@ the port the server published through to a local service and back.
 
 Build and release:
 
-* No C dependency anywhere — the AES-CFB, snappy framing, SHA-1/HMAC/PBKDF2 and
-  the yamux multiplexer are all pure Rust — so cross-compiling needs no
-  `gcc-arm-linux-*` package and the process carries no crypto library's per-thread
-  state.
+* No C dependency in the frp protocol stack — the AES-CFB, snappy framing,
+  SHA-1/HMAC/PBKDF2 and the yamux multiplexer are all pure Rust. The one C
+  dependency is `ring`, which `rustls` uses for the TLS handshake; it is a build
+  requirement for a C compiler, not a runtime link to a crypto library, and zig
+  supplies that compiler for the cross builds as well as the linker. The process
+  still carries no crypto library's per-thread state or arena allocators.
 * `scripts/build-arm.sh` / `scripts/build-arm.ps1` cross-compile to
   `armv7-unknown-linux-{musleabihf,gnueabihf}` and `aarch64-unknown-linux-musl`.
 * `.github/workflows/ci.yml`: format, clippy over all targets, unit tests, a
@@ -221,7 +264,8 @@ effect.
   `udp` proxies or visitors: a proxy that asks for either has its connections
   refused rather than bridged unwrapped, since the registration told the server
   otherwise.
-* The TLS, websocket and KCP transports.
+* The websocket, WSS and KCP transports. TLS is not on this list — it is
+  `transport.tls`, it sits on top of `tcp`, and it is implemented.
 * The client-side plugins — `http_proxy`, `socks5`, `static_file`,
   `unix_domain_socket`, `tls2raw`, `http2http` and the `https2*` family — and
   their `http2https` shape. A proxy naming one is skipped.

@@ -12,7 +12,8 @@
 //! * [`msg`] — the 18 message types, and the v1 (`type byte ‖ len ‖ JSON`) and
 //!   v2 (`magic ‖ frame header`) framings.
 //! * [`proto`] — connections that stack framing, crypto and compression, plus the
-//!   transports (tcp/tls/websocket/kcp) and the yamux session multiplexer.
+//!   transports (`tcp`, with `transport.tls` layered on it) and the yamux session
+//!   multiplexer.
 //! * [`config`] — TOML, YAML/JSON and legacy INI parsing into one model that
 //!   mirrors `pkg/config/v1`.
 //! * [`client`] — the login loop, control session, proxy wrappers and visitors.

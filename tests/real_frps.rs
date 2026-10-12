@@ -34,12 +34,17 @@ use tokio::process::{Child, Command};
 const CONTROL_PORT: u16 = 17_000;
 /// Must match tests/fixtures/frps-integration-nomux.toml.
 const CONTROL_PORT_NO_MUX: u16 = 17_100;
+/// Must match tests/fixtures/frps-integration-tls.toml, whose server refuses
+/// anything that is not a TLS handshake.
+const CONTROL_PORT_TLS: u16 = 17_200;
 /// The public port the multiplexed round-trip test asks `frps` to open.
 /// Deliberately away from the control ports and from anything a developer is
 /// likely to be using.
 const REMOTE_PORT: u16 = 17_200;
 /// The same for the non-multiplexed round trip.
 const REMOTE_PORT_NO_MUX: u16 = 17_201;
+/// The same for the TLS round trip, which runs against its own server.
+const REMOTE_PORT_TLS: u16 = 17_202;
 /// The UDP port `frps` is asked to publish.
 const REMOTE_PORT_UDP: u16 = 17_210;
 /// The local port the stcp *visitor* binds, which is where a user connects.
@@ -76,6 +81,17 @@ fn frps_without_mux() -> Option<(String, String)> {
     let (bin, config) = frps()?;
     let no_mux = config.replace("frps-integration.toml", "frps-integration-nomux.toml");
     Some((bin, no_mux))
+}
+
+/// The same, but for the fixture that forces TLS.
+///
+/// `transport.tls.force` makes frps reject a plain connection outright, so this
+/// is the fixture that can tell "the client speaks TLS" from "the client happens
+/// to work against a server that accepts anything".
+fn frps_with_tls_forced() -> Option<(String, String)> {
+    let (bin, config) = frps()?;
+    let tls = config.replace("frps-integration.toml", "frps-integration-tls.toml");
+    Some((bin, tls))
 }
 
 async fn wait_for_port(port: u16, timeout: Duration) {
@@ -777,6 +793,125 @@ async fn connect_muxer(domain: &str) -> std::result::Result<TcpStream, String> {
     }
 }
 
+/// A `tls.force` server, which is the test a plain-TCP-only client cannot pass.
+///
+/// `transport.tls.enable` defaults to **true**, so TLS is the path a stock
+/// config takes; a server that requires it is the case that was broken until
+/// this was implemented, and it fails loudly rather than silently: frps answers
+/// a non-TLS first byte with `non-TLS connection received on a TlsOnly server`.
+#[tokio::test]
+#[ignore = "needs a real frps: set RUN_REAL_FRPS_TESTS=1, FRPS_BIN and FRPS_CONFIG"]
+async fn real_frps_accepts_a_login_over_tls() {
+    let Some((bin, config_path)) = frps_with_tls_forced() else {
+        return;
+    };
+    let mut frps = start(&bin, &config_path);
+    wait_for_port(CONTROL_PORT_TLS, Duration::from_secs(10)).await;
+
+    let mut config = client_config();
+    config.common.server_port = CONTROL_PORT_TLS;
+    // Stated rather than inherited, so this test keeps testing TLS if the
+    // default ever changes.
+    config
+        .common
+        .transport
+        .as_mut()
+        .unwrap()
+        .tls
+        .as_mut()
+        .unwrap()
+        .enable = Some(true);
+
+    let session = rust_frpc::client::login(&config, "")
+        .await
+        .expect("login over TLS should succeed against a tls.force server");
+    assert_eq!(session.run_id().len(), 16);
+    session.close().await.ok();
+    let _ = frps.kill().await;
+}
+
+/// The same server, with TLS turned off: the client must be refused.
+///
+/// Without this half, a client that quietly ignored `transport.tls.enable` and
+/// always spoke TLS would pass the test above. This is what pins the option to
+/// its meaning.
+#[tokio::test]
+#[ignore = "needs a real frps: set RUN_REAL_FRPS_TESTS=1, FRPS_BIN and FRPS_CONFIG"]
+async fn real_frps_refuses_a_plain_login_to_a_tls_server() {
+    let Some((bin, config_path)) = frps_with_tls_forced() else {
+        return;
+    };
+    let mut frps = start(&bin, &config_path);
+    wait_for_port(CONTROL_PORT_TLS, Duration::from_secs(10)).await;
+
+    let mut config = client_config();
+    config.common.server_port = CONTROL_PORT_TLS;
+    config
+        .common
+        .transport
+        .as_mut()
+        .unwrap()
+        .tls
+        .as_mut()
+        .unwrap()
+        .enable = Some(false);
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        rust_frpc::client::login(&config, ""),
+    )
+    .await
+    .expect("the server should refuse rather than hang");
+    assert!(
+        result.is_err(),
+        "a tls.force server must not accept a plain login"
+    );
+    let _ = frps.kill().await;
+}
+
+/// A `tcp` round trip over TLS, so the whole stack — yamux inside a TLS session,
+/// every work connection and the bridge — is exercised on the default path.
+#[tokio::test]
+#[ignore = "needs a real frps: set RUN_REAL_FRPS_TESTS=1, FRPS_BIN and FRPS_CONFIG"]
+async fn real_frps_carries_a_tcp_round_trip_over_tls() {
+    let Some((bin, config_path)) = frps_with_tls_forced() else {
+        return;
+    };
+    let mut frps = start(&bin, &config_path);
+    wait_for_port(CONTROL_PORT_TLS, Duration::from_secs(10)).await;
+
+    let echo_port = start_echo().await;
+    let mut config = client_config_with_proxy(REMOTE_PORT_TLS, echo_port);
+    config.common.server_port = CONTROL_PORT_TLS;
+    let mut client = spawn_client(config);
+
+    let mut user = wait_for_published(REMOTE_PORT_TLS, Duration::from_secs(10)).await;
+    // Past one TLS record and past the yamux window, so a stream that mishandles
+    // either stalls instead of corrupting.
+    let payload: Vec<u8> = (0..40_000u32).map(|i| (i % 251) as u8).collect();
+    user.write_all(&payload).await.expect("write to the proxy");
+    user.flush().await.expect("flush");
+
+    let mut got = vec![0u8; payload.len()];
+    tokio::time::timeout(Duration::from_secs(10), user.read_exact(&mut got))
+        .await
+        .expect("the echo should come back within ten seconds")
+        .expect("read the echo");
+    assert_eq!(got, payload, "the bytes came back changed");
+
+    drop(user);
+    let (to_local, to_work) = client.next_connection(Duration::from_secs(10)).await;
+    assert_eq!(
+        to_local,
+        payload.len() as u64,
+        "bytes reaching the local end"
+    );
+    assert_eq!(to_work, payload.len() as u64, "bytes leaving the local end");
+
+    client.stop().await;
+    let _ = frps.kill().await;
+}
+
 /// The same login over the non-multiplexed transport, so a regression in either
 /// path is caught.
 #[tokio::test]
@@ -918,9 +1053,28 @@ async fn real_frps_carries_a_tcp_round_trip_without_mux() {
 /// socket surfaces as a reset on the next read and which then repeats on every
 /// later read of that socket — so a retry loop that reuses one spins instead of
 /// waiting.
+///
+/// The budget is a **deadline**, and a failed attempt sleeps before the next
+/// one. An attempt count alone is not a budget here: when the port is still
+/// closed the reset comes back in microseconds, so 40 attempts finish in about
+/// as many microseconds and the loop gives up on a condition that would have
+/// cleared a moment later. That is not a hypothetical — it is what made this the
+/// one test in the suite that failed once in fourteen full runs and never once
+/// on its own, which is exactly the shape of a spinner rather than a slow
+/// server.
 async fn udp_round_trip(target: std::net::SocketAddr, payload: &[u8]) -> Vec<u8> {
-    const ATTEMPTS: u32 = 40;
-    for attempt in 0..ATTEMPTS {
+    const PATIENCE: Duration = Duration::from_secs(10);
+    /// Long enough that a reset cannot eat the budget, short enough that the
+    /// first answer is not delayed by it.
+    const BETWEEN_ATTEMPTS: Duration = Duration::from_millis(50);
+
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    let mut attempts = 0u32;
+    // Assigned on every path before it is read, which is what makes the panic
+    // below able to name the last failure rather than just the count.
+    let mut last: String;
+    loop {
+        attempts += 1;
         let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         // Best effort: Windows reports the ICMP unreachable here, and the read
         // below is what actually decides.
@@ -933,11 +1087,17 @@ async fn udp_round_trip(target: std::net::SocketAddr, payload: &[u8]) -> Vec<u8>
                 return buf;
             }
             // Refused, timed out, or reset: try again on a new socket.
-            _ if attempt + 1 < ATTEMPTS => continue,
-            other => panic!("frps never carried a udp datagram to the local service: {other:?}"),
+            other => last = format!("{other:?}"),
         }
+
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "frps never carried a udp datagram to the local service in {PATIENCE:?} \
+                 ({attempts} attempts, last: {last})"
+            );
+        }
+        tokio::time::sleep(BETWEEN_ATTEMPTS).await;
     }
-    unreachable!("the loop returns or panics")
 }
 
 /// A `udp` proxy: a datagram out through the port `frps` published, an answer

@@ -54,6 +54,14 @@ snap = "1"
 
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 thiserror = "2"
+# `transport.tls`, which is on by default, so this is the default path.
+#
+# The `ring` provider rather than the default `aws-lc-rs` one: `ring` needs only
+# a C compiler, which cargo-zigbuild already has in zig, where aws-lc-rs also
+# wants cmake and (on Windows) nasm. `tls12` is kept because frps's Go server
+# will negotiate either version and an old `frps` may offer only 1.2.
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12", "logging"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "test-util", "process"] }

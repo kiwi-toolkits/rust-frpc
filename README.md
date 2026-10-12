@@ -89,9 +89,19 @@ from a half-parsed file: an unreadable config is logged and ignored.
   has been verified against `0.61.0`.
 * Wire protocol **v1**, which is the default and what older servers understand.
   `Transport.tcpMux` on or off both work.
-* Transports: plain `tcp` today, with or without `tcpMux`. `tls`, `websocket`
-  and `kcp` are next. `quic` is deliberately out of scope for now — see the
-  roadmap.
+* Transports: `tcp`, plain or with `tcpMux`, and TLS on top of it via
+  `transport.tls` — which defaults to **on**, so a stock config dials TLS.
+  `kcp`, `websocket` and `wss` are next; `quic` is deliberately out of scope for
+  now — see the roadmap.
+* `transport.tls` is honoured in full: `enable`, `serverName` (falling back to
+  `serverAddr`), `certFile`/`keyFile`, `trustedCaFile` and
+  `disableCustomTLSFirstByte`. Note the two defaults that decide the wire: the
+  `0x17` head byte is only sent when `disableCustomTLSFirstByte` is explicitly
+  **false**, and the server certificate is **not** verified unless
+  `trustedCaFile` is set — the same `InsecureSkipVerify = true` the Go client
+  uses. `tests/fixtures/frps-integration-tls.toml` runs a server with
+  `tls.force = true`, which rejects a plain client outright, and the suite logs
+  in against it and carries a round trip through it.
 * Proxies: `tcp`, `udp`, `http`, `https`, `tcpmux`, `stcp` and `sudp`. `xtcp` is
   accepted by the config layer and rejected at registration for now.
 * Visitors: `stcp` and `sudp`, which is how those proxies are reached — nothing is

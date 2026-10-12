@@ -58,25 +58,11 @@ pub async fn connect(config: &ClientConfig) -> Result<(Codec, Connector)> {
 
     let codec = Codec::new(WireProtocol::parse(&transport_cfg.wire_protocol));
 
-    let addr = transport::join_host_port(&common.server_addr, common.server_port);
-
-    let dial_timeout = Duration::from_secs(transport_cfg.dial_server_timeout.max(1) as u64);
-    // A negative `dialServerKeepalive` means "no probes".
-    let keepalive = match transport_cfg.dial_server_keepalive {
-        value if value > 0 => Some(Duration::from_secs(value as u64)),
-        _ => None,
-    };
+    let dial = transport::Dial::from_config(common)?;
     let mux_keepalive = Duration::from_secs(transport_cfg.tcp_mux_keepalive_interval.max(1) as u64);
 
-    let connector = Connector::open(
-        &addr,
-        dial_timeout,
-        &transport_cfg.connect_server_local_ip,
-        keepalive,
-        transport_cfg.tcp_mux.unwrap_or(true),
-        mux_keepalive,
-    )
-    .await?;
+    let connector =
+        Connector::open(dial, transport_cfg.tcp_mux.unwrap_or(true), mux_keepalive).await?;
 
     Ok((codec, connector))
 }

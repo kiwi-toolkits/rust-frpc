@@ -1,0 +1,25 @@
+# frps for the TLS half of tests/real_frps.rs.
+#
+# `transport.tls.force` is the point of this fixture: it makes the server reject
+# anything that is not a TLS handshake, so a client that only speaks plain TCP
+# cannot log in at all. That is the difference between "TLS is implemented" and
+# "the client's default TLS path is what the server sees".
+#
+# Note that no certificate is configured. An frps with an empty
+# `transport.tls.certFile` generates a self-signed key pair at startup, and the
+# client does not verify it unless `transport.tls.trustedCaFile` is set — which
+# is the Go client's behaviour too (`InsecureSkipVerify = true` is the default
+# there). So this fixture needs no certificate material checked in.
+#
+# Port 17200 keeps it clear of the multiplexed (17000) and non-multiplexed
+# (17100) fixtures.
+bindAddr = "127.0.0.1"
+bindPort = 17200
+
+log.to = "console"
+log.level = "info"
+
+auth.method = "token"
+auth.token = "rust-frpc-integration"
+
+transport.tls.force = true

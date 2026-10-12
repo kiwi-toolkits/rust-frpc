@@ -13,11 +13,14 @@ rustup target add armv7-unknown-linux-gnueabihf
 rustup target add aarch64-unknown-linux-musl
 ```
 
-Zig must be on `PATH` as well. Here it is only supplying the **linker**: this
-crate has no C dependency anywhere — the crypto, the compression and the yamux
-multiplexer are all pure Rust — so there is no build script to satisfy and no
-`gcc-arm-linux-gnueabihf` package to install. That is a deliberate difference from
-projects that link OpenSSL or aws-lc, and it makes these builds quick.
+Zig must be on `PATH` as well. Here it supplies **both** the linker and the C
+compiler: everything in the frp protocol stack — the crypto, the compression and
+the yamux multiplexer — is pure Rust, but `rustls` builds `ring` for the TLS
+handshake, and `ring` needs a C compiler for the target. `cargo-zigbuild` sets
+`CC_<target>` to `zig cc`, so that compiler is the same zig binary that is
+already doing the linking and no `gcc-arm-linux-gnueabihf` package is needed.
+That is still a deliberate difference from projects that link OpenSSL or
+aws-lc, and it makes these builds quick.
 
 If `zig` and `cargo-zigbuild` live in the repository's `.tools/` directory (a
 common local setup), the build scripts put them on `PATH` themselves. That is

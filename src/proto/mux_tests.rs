@@ -2,10 +2,12 @@
 mod tests {
     use super::super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
 
-    /// Two sessions over a real loopback socket. `Session` needs a `TcpStream`,
-    /// and a real socket is the honest thing to test a byte protocol against
-    /// anyway.
+    /// Two sessions over a real loopback socket. A real socket is the honest
+    /// thing to test a byte protocol against, and it is also what the client
+    /// hands the session in practice — a TLS stream arrives only when
+    /// `transport.tls.enable` is on.
     async fn pair() -> (Session, Session) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

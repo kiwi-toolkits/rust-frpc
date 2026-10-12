@@ -8,9 +8,10 @@
 #   rustup target add armv7-unknown-linux-gnueabihf
 #   rustup target add aarch64-unknown-linux-musl
 #
-# Unlike the reference project this one has no C dependency at all — everything
-# is pure Rust — so zig is only supplying the linker. That makes these builds
-# quick, and means no cross-gcc package is needed.
+# The frp protocol stack here is pure Rust, but rustls builds `ring` for the TLS
+# handshake and ring needs a C compiler for the target. cargo-zigbuild points
+# CC_<target> at `zig cc`, so zig supplies that compiler as well as the linker —
+# which still means no cross-gcc package is needed, and these builds stay quick.
 #
 # If zig and cargo-zigbuild live in a local .tools/ directory, put their
 # directories first on PATH before running this script.

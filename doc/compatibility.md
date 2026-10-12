@@ -226,5 +226,7 @@ docs too.
 | "connect to server error" and "start proxy success" | Go's wording, with the delay or remote address appended | The leading text is what a runbook or a log parser keys on, so it is kept verbatim; the appended value is an addition. |
 | `wireType` | Added | `virtual_net` uses it upstream; nothing else does. Only `tcp` and `udp` are honoured, since announcing a type this side cannot speak would register a proxy that never works. |
 | `quic` transport | Not supported | The Rust QUIC stack costs binary size and build time; `kcp` covers the same weak-network case for now. |
+| `kcp`, `websocket` and `wss` transports | Not supported yet | Only `transport.protocol = "tcp"` dials. `tls` is not a separate protocol on the frp side either — it is `transport.tls`, and that *is* implemented, on top of `tcp`. |
+| TLS verification | Off unless `trustedCaFile` is set | Go's `InsecureSkipVerify = true` is the default there, so this is the same behaviour rather than a liberty: the handshake, the key exchange and the transcript signature are real, and it is the chain and the server name that go unchecked. Set `transport.tls.trustedCaFile` to turn verification on. |
 | YAML and JSON configs | Not supported | Go sniffs all three formats by content; this dispatches legacy-INI versus TOML only. A `.yaml` or `.json` config is read as TOML and fails rather than being misread. |
 | Version string | `rust-frpc.<version>` | `frps` logs it and the dashboard shows it, so an operator can tell which client is which. No compatibility impact. |

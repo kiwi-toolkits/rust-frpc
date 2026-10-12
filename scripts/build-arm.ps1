@@ -1,7 +1,8 @@
 # Windows cross-build for ARM Linux: armv7 and aarch64, both musl.
 #
-# Needs zig and cargo-zigbuild. Unlike the reference project there is no C
-# dependency anywhere in this crate, so zig is only supplying the linker.
+# Needs zig and cargo-zigbuild. The frp protocol stack here is pure Rust, but
+# rustls builds `ring` for the TLS handshake and ring needs a C compiler for the
+# target, so zig supplies that compiler as well as the linker.
 #
 #   cargo install cargo-zigbuild
 #

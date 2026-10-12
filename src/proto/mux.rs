@@ -33,8 +33,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, ReadHalf, WriteHalf};
 use tokio::sync::{mpsc, Notify};
 
 use crate::error::{Error, Result};
@@ -106,21 +105,33 @@ impl Session {
     ///
     /// Returns as soon as the background reader and writer are running; the
     /// first `OpenStream` or `accept` is what actually talks to the peer.
-    pub fn client(socket: TcpStream, config: Config) -> Session {
+    pub fn client<S>(socket: S, config: Config) -> Session
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         Self::new(socket, config, Role::Client)
     }
 
     /// A server session takes even stream ids, which is how the two ends avoid
     /// colliding. frp only ever uses this side inside tests.
-    pub fn server(socket: TcpStream, config: Config) -> Session {
+    pub fn server<S>(socket: S, config: Config) -> Session
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         Self::new(socket, config, Role::Server)
     }
 
-    fn new(socket: TcpStream, config: Config, role: Role) -> Session {
+    /// Generic over the socket because the transport is not always a `TcpStream`:
+    /// with `transport.tls.enable` on — the default — the bytes come out of a
+    /// TLS session instead, and there is nothing about multiplexing that cares.
+    fn new<S>(socket: S, config: Config, role: Role) -> Session
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         // The socket is split so the reader and writer never contend for it: the
         // reader only reads and the writer only writes, which is the whole point
         // of a multiplexer.
-        let (read_half, write_half) = socket.into_split();
+        let (read_half, write_half) = tokio::io::split(socket);
         let (send_tx, send_rx) = mpsc::channel::<Outbound>(64);
         let (accept_tx, accept_rx) = mpsc::channel::<Arc<StreamState>>(16);
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -681,7 +692,10 @@ impl AsyncWrite for Stream {
 }
 
 /// Reads frames off the socket and dispatches them.
-async fn read_loop(inner: Arc<Inner>, mut socket: tokio::net::tcp::OwnedReadHalf) {
+async fn read_loop<S>(inner: Arc<Inner>, mut socket: ReadHalf<S>)
+where
+    S: AsyncRead + Unpin,
+{
     let mut header = [0u8; HEADER_SIZE];
     // Subscribed once rather than per frame. `changed()` is level-triggered for
     // this purpose: before the session dies it never completes, and once it has
@@ -757,14 +771,17 @@ async fn read_loop(inner: Arc<Inner>, mut socket: tokio::net::tcp::OwnedReadHalf
     }
 }
 
-async fn handle_stream_frame(
+async fn handle_stream_frame<S>(
     inner: &Arc<Inner>,
-    socket: &mut tokio::net::tcp::OwnedReadHalf,
+    socket: &mut ReadHalf<S>,
     frame_type: u8,
     frame_flags: u16,
     stream_id: u32,
     length: u32,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: AsyncRead + Unpin,
+{
     // A SYN opens a stream we did not ask for. The map lock is released before
     // the await below: holding a `MutexGuard` across an await would make the
     // reader task non-`Send`.
@@ -855,12 +872,14 @@ async fn handle_stream_frame(
 }
 
 /// Drains the outbound queue onto the socket.
-async fn write_loop(
+async fn write_loop<S>(
     inner: Arc<Inner>,
-    mut socket: tokio::net::tcp::OwnedWriteHalf,
+    mut socket: WriteHalf<S>,
     mut rx: mpsc::Receiver<Outbound>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
-) {
+) where
+    S: AsyncWrite + Unpin,
+{
     let mut ping_timer = tokio::time::interval(inner.config.keepalive_interval);
     ping_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // The first tick fires immediately; the session is not established yet, so
@@ -935,10 +954,10 @@ async fn write_loop(
     }
 }
 
-async fn write_frame(
-    socket: &mut tokio::net::tcp::OwnedWriteHalf,
-    frame: &Outbound,
-) -> io::Result<()> {
+async fn write_frame<S>(socket: &mut WriteHalf<S>, frame: &Outbound) -> io::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
     socket.write_all(&frame.header).await?;
     if !frame.body.is_empty() {
         socket.write_all(&frame.body).await?;

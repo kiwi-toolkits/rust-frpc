@@ -80,8 +80,16 @@ curl localhost:7400/metrics  # 纯文本计数器
   不是发布说明。`tests/real_frps.rs` 会对你指定的 `frps` 二进制做端到端验证，
   目前已在 `0.61.0` 上跑通。
 * 线协议为 **v1**（默认值，也是旧版服务端唯一认识的取值），`transport.tcpMux` 开或关都支持。
-* 传输方式：当前为纯 `tcp`，`tcpMux` 开或关都支持；`tls`、`websocket`、`kcp` 下一步支持。
+* 传输方式：`tcp`（`tcpMux` 开或关），以及建立在它之上的 TLS——`transport.tls`
+  **默认开启**，所以一份普通配置走的就是 TLS。`kcp`、`websocket`、`wss` 下一步支持；
   `quic` 暂不在范围内，见路线图。
+* `transport.tls` 已完整生效：`enable`、`serverName`（为空时回退到 `serverAddr`）、
+  `certFile`/`keyFile`、`trustedCaFile`、`disableCustomTLSFirstByte`。有两个默认值直接决定
+  线上字节，容易记反：`0x17` 首字节**只有**在 `disableCustomTLSFirstByte` 显式设为 `false`
+  时才发送；服务端证书**默认不校验**，除非配置了 `trustedCaFile`——与 go 版的
+  `InsecureSkipVerify = true` 一致。`tests/fixtures/frps-integration-tls.toml` 起了一个
+  `tls.force = true` 的服务端，它会直接拒绝明文客户端，测试套件既对它完成登录，也通过它
+  跑通整条回环。
 * 代理类型：目前支持 `tcp`、`udp`、`http`、`https`、`tcpmux`、`stcp` 与 `sudp`。
   `xtcp` 在配置层可解析，注册时会明确拒绝。
 * visitor：支持 `stcp` 与 `sudp`——这两类代理不在服务端暴露任何端口，因此需要 visitor 在本地

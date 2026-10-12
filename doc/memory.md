@@ -22,10 +22,12 @@ the footprint is a decision rather than an accident.
   every proxy's status tick, so 100 proxies cost one wakeup, not 100.
 * **Logging.** A record below the configured level allocates nothing. Timestamps
   are formatted lazily against a cached second.
-* **No C dependencies at all.** Everything — the AES-CFB, the snappy framing, the
-  SHA-1/HMAC/PBKDF2, the yamux multiplexer — is pure Rust. That keeps the binary
-  small and, more to the point, keeps the process free of a crypto library's
-  arena allocators and its per-thread state.
+* **No C dependency in the frp protocol stack.** The AES-CFB, the snappy framing,
+  the SHA-1/HMAC/PBKDF2 and the yamux multiplexer are all pure Rust. The one
+  exception is `ring`, which `rustls` builds for the TLS handshake: it is
+  compiled in rather than linked, so there is no shared library and no OpenSSL
+  arena allocator, but it does bring its own static tables. Measured rather than
+  assumed — the idle budget below passes with TLS on, which is the default.
 
 ## Measuring
 

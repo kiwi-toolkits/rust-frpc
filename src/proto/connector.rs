@@ -15,16 +15,15 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::TcpStream;
 
 use crate::error::{Error, Result};
 use crate::proto::mux;
 use crate::proto::transport;
 
-/// A logical connection to `frps`: a yamux stream, or a whole TCP socket.
+/// A logical connection to `frps`: a yamux stream, or a whole socket.
 #[derive(Debug)]
 pub enum LogicalConn {
-    Plain(TcpStream),
+    Plain(transport::Stream),
     Stream(mux::Stream),
 }
 
@@ -101,17 +100,17 @@ impl Connector {
         }
     }
 
-    /// Builds a connector from a completed transport config.
+    /// Builds a connector from a completed config.
+    ///
+    /// `dial` carries the transport layers; `tcp_mux` is the separate decision
+    /// of whether the resulting stream gets a yamux session on top of it.
     pub async fn open(
-        addr: &str,
-        dial_timeout: Duration,
-        local_ip: &str,
-        keepalive: Option<Duration>,
+        dial: transport::Dial,
         tcp_mux: bool,
         mux_keepalive: Duration,
     ) -> Result<Connector> {
         if tcp_mux {
-            let socket = transport::connect(addr, dial_timeout, local_ip, keepalive).await?;
+            let socket = transport::connect(&dial).await?;
             let session = mux::Session::client(
                 socket,
                 mux::Config {
@@ -121,12 +120,7 @@ impl Connector {
             );
             Ok(Connector::Muxed(MuxConnector { session }))
         } else {
-            Ok(Connector::Plain(PlainConnector {
-                addr: addr.to_string(),
-                dial_timeout,
-                local_ip: local_ip.to_string(),
-                keepalive,
-            }))
+            Ok(Connector::Plain(PlainConnector { dial }))
         }
     }
 }
@@ -134,22 +128,12 @@ impl Connector {
 /// A connector for the non-multiplexed case: every logical connection is a dial.
 #[derive(Debug, Clone)]
 pub struct PlainConnector {
-    addr: String,
-    dial_timeout: Duration,
-    local_ip: String,
-    keepalive: Option<Duration>,
+    dial: transport::Dial,
 }
 
 impl PlainConnector {
     async fn connect(&self) -> Result<LogicalConn> {
-        let socket = transport::connect(
-            &self.addr,
-            self.dial_timeout,
-            &self.local_ip,
-            self.keepalive,
-        )
-        .await?;
-        Ok(LogicalConn::Plain(socket))
+        Ok(LogicalConn::Plain(transport::connect(&self.dial).await?))
     }
 }
 
@@ -192,6 +176,18 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    /// A dial with no layers on it, which is what these tests are about.
+    fn plain_dial(addr: &str) -> transport::Dial {
+        transport::Dial {
+            protocol: transport::Protocol::Tcp,
+            tls: None,
+            addr: addr.to_string(),
+            timeout: Duration::from_secs(5),
+            local_ip: String::new(),
+            keepalive: None,
+        }
+    }
+
     #[test]
     fn retryability_distinguishes_transport_from_policy() {
         assert!(is_retryable(&Error::other("connection refused")));
@@ -217,10 +213,7 @@ mod tests {
         });
 
         let connector = Connector::Plain(PlainConnector {
-            addr: addr.to_string(),
-            dial_timeout: Duration::from_secs(5),
-            local_ip: String::new(),
-            keepalive: None,
+            dial: plain_dial(&addr.to_string()),
         });
         assert!(!connector.is_muxed());
 
@@ -241,16 +234,10 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server_socket = tokio::spawn(async move { listener.accept().await.unwrap().0 });
 
-        let connector = Connector::open(
-            &addr.to_string(),
-            Duration::from_secs(5),
-            "",
-            None,
-            true,
-            Duration::from_secs(30),
-        )
-        .await
-        .unwrap();
+        let connector =
+            Connector::open(plain_dial(&addr.to_string()), true, Duration::from_secs(30))
+                .await
+                .unwrap();
         assert!(connector.is_muxed());
 
         let socket = server_socket.await.unwrap();
