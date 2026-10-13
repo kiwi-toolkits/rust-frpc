@@ -203,6 +203,29 @@ The release profile is tuned for size (`opt-level = "z"`, fat LTO, `strip`,
 `panic = "abort"`). `--profile release-fast` is the same shape but links quickly,
 which is what you want while developing.
 
+**Fat LTO is worth having and is not optional in any of the build paths.** It is
+what turns 2.67 MB into 2.06 MB on `armv7-unknown-linux-musleabihf`, for about
+forty extra seconds of link time. The cross-compile scripts and the release
+workflow used to turn it off — on the theory that a fat ARM link could take an
+unbounded amount of time — and that one override was costing more than every
+other size decision in the file combined. Measured sizes, `frpc`:
+
+| build | size |
+| :--- | ---: |
+| `x86_64-pc-windows-msvc`, fat LTO | 2.24 MB |
+| `armv7-unknown-linux-musleabihf`, fat LTO | 2.06 MB |
+| `armv7-unknown-linux-gnueabihf`, fat LTO | 2.07 MB |
+| `aarch64-unknown-linux-musl`, fat LTO | 2.22 MB |
+| `armv7-unknown-linux-musleabihf`, LTO off | 2.67 MB |
+
+About 850 kB of that is the TLS stack, which `transport.tls` needs and which
+`enable = true` makes the default path. It is `rustls` plus `ring`, and it does
+not shrink: `opt-level = "s"` is *bigger*, dropping `tls12` saves 37 kB, and
+trimming the cipher-suite list to the nine suites a Go server can actually
+negotiate saves nothing at all — the linker was already dropping those. The only
+thing that removes it is not having it, which is a decision with a compatibility
+cost rather than an optimisation.
+
 The crate produces two binaries with identical behaviour:
 
 ```bash

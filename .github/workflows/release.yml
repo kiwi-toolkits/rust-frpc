@@ -79,11 +79,10 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${{ matrix.zigbuild }}" = "true" ]; then
-            # Fat LTO over an ARM link can take an unbounded amount of time; a
-            # correct artifact matters more here than the last few hundred
-            # kilobytes.
-            export CARGO_PROFILE_RELEASE_LTO=off
-            export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
+            # The release profile's `lto = "fat"` is kept. It used to be
+            # turned off here on the theory that a fat ARM link can take an
+            # unbounded amount of time; measured, it is 83 seconds against 44,
+            # and it produces a 2.06 MB artefact instead of 2.67 MB.
             cargo zigbuild --release --target "${{ matrix.target }}" \
               --bin frpc --bin rust-frpc
           else

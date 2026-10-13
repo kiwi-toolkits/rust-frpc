@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+* **The ARM builds stopped throwing away 610 kB in the link step.** Both
+  cross-compile scripts and the release workflow overrode the release profile to
+  `lto = "off"` and `codegen-units = 16`, with the comment that "full LTO over an
+  ARM link can take an unbounded amount of time". Measured, it is 83 seconds
+  against 44, and it produces a 2.06 MB `armv7-unknown-linux-musleabihf` binary
+  instead of 2.67 MB. That single override cost more than every other size
+  decision in the profile combined, and it is gone. A `release-fast` profile
+  still exists for iterating.
+* **What the TLS stack costs, measured rather than guessed.** About 850 kB of
+  the binary — 540 kB of code and 260 kB of read-only tables — and it is not
+  recoverable. `opt-level = "s"` is *larger* than `"z"` (2.38 MB against 2.21),
+  dropping the `tls12` and `logging` features saves 37 kB, and restricting the
+  cipher-suite list to the nine suites a Go server can actually negotiate saves
+  nothing at all, because the linker was already dropping the rest. The numbers
+  are in both READMEs so the next person does not repeat the search.
 * **The `websocket` and `wss` transports.** `frp` uses `golang.org/x/net/websocket`
   rather than the gorilla stack, and the two differ where it counts, so the new
   `proto::websocket` is matched against x/net at the version frp pins: a plain

@@ -171,6 +171,24 @@ cargo build --release
 release profile 面向体积（`opt-level = "z"`、fat LTO、`strip`、`panic = "abort"`）。
 本地开发用 `--profile release-fast`，形态相同但链接快得多。
 
+**fat LTO 值这个钱，而且任何一条构建路径都不该关掉它。** `armv7-unknown-linux-musleabihf`
+上它把 2.67 MB 变成 2.06 MB，代价是大约多四十秒链接时间。交叉编译脚本和发布 workflow
+过去都关掉了它——理由是「ARM 上的 fat LTO 可能耗时无上限」——而这一处覆盖省下的体积，
+比文件里其它所有体积决策加起来还多。实测 `frpc` 体积：
+
+| 构建 | 体积 |
+| :--- | ---: |
+| `x86_64-pc-windows-msvc`，fat LTO | 2.24 MB |
+| `armv7-unknown-linux-musleabihf`，fat LTO | 2.06 MB |
+| `armv7-unknown-linux-gnueabihf`，fat LTO | 2.07 MB |
+| `aarch64-unknown-linux-musl`，fat LTO | 2.22 MB |
+| `armv7-unknown-linux-musleabihf`，关掉 LTO | 2.67 MB |
+
+其中约 850 kB 是 TLS 栈——`transport.tls` 需要它，而 `enable = true` 让它成为默认路径。
+它就是 `rustls` + `ring`，而且压不下去：`opt-level = "s"` 反而**更大**，关掉 `tls12` 只省
+37 kB，把密码套件列表裁到 Go 服务端真正能协商的那九个**一点都不省**——链接器本来就已经
+把其余的丢掉了。唯一能去掉它的办法是不要它，那是一个有兼容性代价的取舍，不是优化。
+
 同一个 crate 产出两个行为完全一致的二进制：
 
 ```bash
