@@ -4,6 +4,28 @@ The boards this crate is aimed at are ARMv7 and ARM64 Linux. The recommended
 artefact is the musl build: statically linked, with no dependency on the target's
 libc, so one binary runs on any rootfs.
 
+## Leaving TLS out
+
+```bash
+scripts/build-arm.sh --no-tls      # or: scripts/build-arm.ps1 -NoTls
+```
+
+`--no-tls` passes `--no-default-features`, which drops `rustls`, `ring` and
+`ring`'s lookup tables. On `armv7-unknown-linux-musleabihf` that is 2.06 MB →
+**1.56 MB**; on `aarch64-unknown-linux-musl`, 2.22 MB → 1.54 MB. It is worth
+knowing what it costs before reaching for it, though:
+
+* frp's default is `transport.tls.enable = true`, so the resulting client
+  **refuses to start** on a stock config. It says so, and names the fix:
+  `transport.tls.enable = false`. That refusal is deliberate — connecting in the
+  clear because the TLS code was not compiled in would be a silent downgrade.
+* Similarly for `transport.protocol = "wss"`, which is a websocket inside TLS.
+* A server with `transport.tls.force = true` cannot be reached at all.
+
+A stock `frps` accepts plain connections, so a no-TLS client works against one
+once the config says `enable = false`. If you do not control the server, take the
+2.06 MB build instead.
+
 ## Prerequisites
 
 ```bash

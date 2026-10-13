@@ -22,6 +22,20 @@ path = "src/bin/frpc.rs"
 name = "rust-frpc"
 path = "src/bin/rust-frpc.rs"
 
+[features]
+default = ["tls"]
+# `transport.tls`, and the `wss` transport that is built on it.
+#
+# On by default because frp's own default is `enable = true` — a stock config
+# dials TLS, and a build without it would refuse to run that config. Turn it off
+# with `--no-default-features` and the whole stack goes: `rustls`, `ring` and its
+# lookup tables, 523 kB on armv7-unknown-linux-musleabihf and 850 kB natively.
+#
+# A config that asks for TLS then *fails at startup* rather than connecting in
+# the clear. That is deliberate: silently downgrading would turn a size
+# optimisation into an unnoticed plaintext tunnel.
+tls = ["dep:rustls", "dep:tokio-rustls"]
+
 [dependencies]
 tokio = { version = "1", features = [
     "rt",
@@ -54,14 +68,15 @@ snap = "1"
 
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 thiserror = "2"
-# `transport.tls`, which is on by default, so this is the default path.
+# `transport.tls`, behind the `tls` feature. See above for why it is on by
+# default and what turning it off costs.
 #
 # The `ring` provider rather than the default `aws-lc-rs` one: `ring` needs only
 # a C compiler, which cargo-zigbuild already has in zig, where aws-lc-rs also
 # wants cmake and (on Windows) nasm. `tls12` is kept because frps's Go server
 # will negotiate either version and an old `frps` may offer only 1.2.
-rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12", "logging"] }
-tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls = { version = "0.23.45", optional = true, default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26.6", optional = true, default-features = false, features = ["ring", "tls12", "logging"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "test-util", "process"] }

@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+* **A `tls` feature, on by default, so a build can leave TLS out.** It is the
+  only thing that removes the `rustls` and `ring` cost, and it takes
+  `armv7-unknown-linux-musleabihf` from 2.06 MB to **1.56 MB** — which is where
+  it was before TLS existed. `scripts/build-arm.sh --no-tls` and
+  `build-arm.ps1 -NoTls` produce it.
+* **A build without the feature refuses a TLS config rather than downgrading.**
+  That is the whole safety argument for the option: `transport.tls.enable`
+  defaults to **true**, so a build that quietly ignored it would turn a size
+  optimisation into a plaintext tunnel nobody asked for. The error names both
+  ways out — `transport.tls.enable = false`, or a build with the feature — and
+  says the same for `transport.protocol = "wss"`, which is a websocket inside
+  TLS. The message is a `const` so the test that checks its wording and the
+  error that carries it cannot drift apart.
+* **Both test suites run in either configuration**, because a build whose other
+  half is never exercised is not tested: 246 unit tests and 26 against a real
+  `frps` with TLS, 242 and 23 without. The three TLS integration tests are gated
+  on the feature; the rest follow the build, so the no-TLS client is driven
+  through the whole plain path against a real server rather than merely
+  compiled.
+* **`--no-tls` is opt-in rather than the ARM default.** Turning it on for every
+  ARM user would break `tls.force` servers for them with an error they did not
+  ask for, and the flag is one word.
+
 * **The ARM builds stopped throwing away 610 kB in the link step.** Both
   cross-compile scripts and the release workflow overrode the release profile to
   `lto = "off"` and `codegen-units = 16`, with the comment that "full LTO over an

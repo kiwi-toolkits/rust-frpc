@@ -15,7 +15,24 @@
 #
 # If zig and cargo-zigbuild live in a local .tools/ directory, put their
 # directories first on PATH before running this script.
+#
+#   build-arm.sh [--no-tls]
+#
+# `--no-tls` builds with `--no-default-features`, which drops `rustls` and `ring`
+# and takes the armv7 artefact from 2.06 MB to 1.54 MB. It is opt-in rather than
+# the default because frp's own default config asks for TLS, and a client built
+# without it refuses to start on that config rather than connecting in the
+# clear. The refusal names the way out (`transport.tls.enable = false`).
 set -eu
+
+NO_TLS=""
+for arg in "$@"; do
+    case "$arg" in
+        --no-tls) NO_TLS="--no-default-features" ;;
+        -h|--help) sed -n "2,30p" "$0"; exit 0 ;;
+        *) echo "unknown argument: $arg (try --help)" >&2; exit 2 ;;
+    esac
+done
 
 TARGETS="armv7-unknown-linux-musleabihf armv7-unknown-linux-gnueabihf aarch64-unknown-linux-musl"
 
@@ -50,7 +67,8 @@ done
 cd "$PROJECT_ROOT"
 for target in $TARGETS; do
     echo "==> $target"
-    cargo zigbuild --release --target "$target" --bin frpc --bin rust-frpc
+    # shellcheck disable=SC2086
+    cargo zigbuild --release --target "$target" --bin frpc --bin rust-frpc $NO_TLS
 done
 
 echo

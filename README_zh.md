@@ -184,10 +184,41 @@ release profile 面向体积（`opt-level = "z"`、fat LTO、`strip`、`panic = 
 | `aarch64-unknown-linux-musl`，fat LTO | 2.22 MB |
 | `armv7-unknown-linux-musleabihf`，关掉 LTO | 2.67 MB |
 
-其中约 850 kB 是 TLS 栈——`transport.tls` 需要它，而 `enable = true` 让它成为默认路径。
+其中约 500–850 kB 是 TLS 栈——`transport.tls` 需要它，而 `enable = true` 让它成为默认路径。
 它就是 `rustls` + `ring`，而且压不下去：`opt-level = "s"` 反而**更大**，关掉 `tls12` 只省
 37 kB，把密码套件列表裁到 Go 服务端真正能协商的那九个**一点都不省**——链接器本来就已经
-把其余的丢掉了。唯一能去掉它的办法是不要它，那是一个有兼容性代价的取舍，不是优化。
+把其余的丢掉了。
+
+### 不带 TLS 构建
+
+有一个默认开启的 `tls` feature，关掉它是去掉这部分的唯一办法：
+
+```bash
+cargo build --release --no-default-features   # 本机 1.41 MB
+scripts/build-arm.sh --no-tls                 # armv7: 2.06 MB -> 1.56 MB
+```
+
+| 目标 | 含 TLS | `--no-tls` |
+| :--- | ---: | ---: |
+| `armv7-unknown-linux-musleabihf` | 2.06 MB | **1.56 MB** |
+| `armv7-unknown-linux-gnueabihf` | 2.07 MB | 1.56 MB |
+| `aarch64-unknown-linux-musl` | 2.22 MB | 1.54 MB |
+| `x86_64-pc-windows-msvc` | 2.24 MB | 1.41 MB |
+
+它默认开启，是因为 frp 自己的默认值就是 `transport.tls.enable = true`，标准配置必须开箱
+可用。不带这个 feature 的构建遇到这种配置会**在启动时拒绝**，而不是明文连出去：
+
+```
+error: transport.tls.enable = true (frp's default) but this build was made
+without TLS support. Set `transport.tls.enable = false` to connect in the clear,
+or use a build with the `tls` feature.
+```
+
+这条拒绝就是这个选项全部的安全论证：静默降级会把一次体积优化变成没人要求的明文隧道。
+`transport.protocol = "wss"` 同样被拒绝，因为它就是 TLS 里的 websocket。
+
+两套测试在两种配置下都跑——含 TLS 时 246 个单元测试 + 26 个真实 frps 端到端，不含时
+242 + 23——因为只跑过默认 feature 的构建，另一半是没测过的。
 
 同一个 crate 产出两个行为完全一致的二进制：
 

@@ -218,13 +218,47 @@ other size decision in the file combined. Measured sizes, `frpc`:
 | `aarch64-unknown-linux-musl`, fat LTO | 2.22 MB |
 | `armv7-unknown-linux-musleabihf`, LTO off | 2.67 MB |
 
-About 850 kB of that is the TLS stack, which `transport.tls` needs and which
+About 500–850 kB of that is the TLS stack, which `transport.tls` needs and which
 `enable = true` makes the default path. It is `rustls` plus `ring`, and it does
 not shrink: `opt-level = "s"` is *bigger*, dropping `tls12` saves 37 kB, and
 trimming the cipher-suite list to the nine suites a Go server can actually
-negotiate saves nothing at all — the linker was already dropping those. The only
-thing that removes it is not having it, which is a decision with a compatibility
-cost rather than an optimisation.
+negotiate saves nothing at all — the linker was already dropping those.
+
+### Building without TLS
+
+There is a `tls` feature, on by default, and turning it off is the only thing
+that removes the rest of that:
+
+```bash
+cargo build --release --no-default-features   # 1.41 MB natively
+scripts/build-arm.sh --no-tls                 # armv7: 2.06 MB -> 1.56 MB
+```
+
+| target | with TLS | `--no-tls` |
+| :--- | ---: | ---: |
+| `armv7-unknown-linux-musleabihf` | 2.06 MB | **1.56 MB** |
+| `armv7-unknown-linux-gnueabihf` | 2.07 MB | 1.56 MB |
+| `aarch64-unknown-linux-musl` | 2.22 MB | 1.54 MB |
+| `x86_64-pc-windows-msvc` | 2.24 MB | 1.41 MB |
+
+It is on by default because frp's own default is `transport.tls.enable = true`,
+and a stock config has to work out of the box. A build without the feature
+**refuses** such a config at startup rather than connecting in the clear:
+
+```
+error: transport.tls.enable = true (frp's default) but this build was made
+without TLS support. Set `transport.tls.enable = false` to connect in the clear,
+or use a build with the `tls` feature.
+```
+
+That refusal is the whole safety argument for the option: silently downgrading
+would turn a size optimisation into a plaintext tunnel nobody asked for.
+`transport.protocol = "wss"` is refused the same way, since it is a websocket
+inside TLS.
+
+Both test suites run in either configuration — 246 unit tests and 26 against a
+real `frps` with TLS, 242 and 23 without — because a build that only ever ran
+the default feature set is a build whose other half is untested.
 
 The crate produces two binaries with identical behaviour:
 

@@ -26,6 +26,7 @@
 //! Only the `tcp` row is implemented so far.
 
 use std::net::SocketAddr;
+#[cfg(feature = "tls")]
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -41,6 +42,17 @@ use crate::error::{Error, Result};
 /// written when `disableCustomTLSFirstByte` is explicitly false — the option
 /// defaults to true, which means the byte is *not* sent.
 pub const FRP_TLS_HEAD_BYTE: u8 = 0x17;
+
+/// What a build with `--no-default-features` says when a config asks for TLS.
+///
+/// `transport.tls.enable` defaults to **true**, so anyone who makes such a build
+/// meets this message on their first run. That makes the wording part of the
+/// feature: it has to name both ways out, and it is a `const` so the test that
+/// checks it cannot drift from the error that carries it.
+#[cfg(not(feature = "tls"))]
+const WITHOUT_TLS: &str = "transport.tls.enable = true (frp's default) but this build was made \
+                           without TLS support. Set `transport.tls.enable = false` to connect \
+                           in the clear, or use a build with the `tls` feature.";
 
 /// `transport.protocol`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,10 +95,16 @@ impl Protocol {
 
     /// Whether this client can actually dial it yet.
     ///
-    /// `wss` implies TLS whatever `transport.tls.enable` says — the Go client
-    /// sets `tlsEnable = true` for it before it reads the option.
+    /// `wss` is a websocket inside TLS, so a build without the `tls` feature
+    /// cannot dial it. That is also why it implies TLS whatever
+    /// `transport.tls.enable` says — the Go client sets `tlsEnable = true` for
+    /// it before it reads the option.
     pub fn is_implemented(self) -> bool {
-        matches!(self, Protocol::Tcp | Protocol::Websocket | Protocol::Wss)
+        match self {
+            Protocol::Tcp | Protocol::Websocket => true,
+            Protocol::Wss => cfg!(feature = "tls"),
+            Protocol::Kcp | Protocol::Quic => false,
+        }
     }
 }
 
@@ -146,6 +164,14 @@ impl Dial {
             .and_then(|tls| tls.enable)
             .unwrap_or(true)
             || matches!(protocol, Protocol::Wss);
+        // A build without the `tls` feature refuses rather than degrading. The
+        // option defaults to *on*, so the alternative — connecting in the clear
+        // because the TLS code was not compiled in — would take a size
+        // optimisation and turn it into a plaintext tunnel nobody asked for.
+        #[cfg(not(feature = "tls"))]
+        if tls_on {
+            return Err(Error::config(WITHOUT_TLS));
+        }
         let tls = if tls_on {
             let configured = transport.tls.clone().unwrap_or_default();
             let server_name = if configured.server_name.is_empty() {
@@ -191,6 +217,7 @@ pub enum Stream {
     Tcp(TcpStream),
     /// The inner `Stream` is boxed because the type would otherwise contain
     /// itself.
+    #[cfg(feature = "tls")]
     Tls(Box<tokio_rustls::client::TlsStream<Stream>>),
     Websocket(Box<super::websocket::WebSocket<Stream>>),
 }
@@ -203,6 +230,7 @@ impl AsyncRead for Stream {
     ) -> std::task::Poll<std::io::Result<()>> {
         match self.get_mut() {
             Stream::Tcp(socket) => std::pin::Pin::new(socket).poll_read(cx, buf),
+            #[cfg(feature = "tls")]
             Stream::Tls(tls) => std::pin::Pin::new(tls.as_mut()).poll_read(cx, buf),
             Stream::Websocket(ws) => std::pin::Pin::new(ws.as_mut()).poll_read(cx, buf),
         }
@@ -217,6 +245,7 @@ impl AsyncWrite for Stream {
     ) -> std::task::Poll<std::io::Result<usize>> {
         match self.get_mut() {
             Stream::Tcp(socket) => std::pin::Pin::new(socket).poll_write(cx, buf),
+            #[cfg(feature = "tls")]
             Stream::Tls(tls) => std::pin::Pin::new(tls.as_mut()).poll_write(cx, buf),
             Stream::Websocket(ws) => std::pin::Pin::new(ws.as_mut()).poll_write(cx, buf),
         }
@@ -228,6 +257,7 @@ impl AsyncWrite for Stream {
     ) -> std::task::Poll<std::io::Result<()>> {
         match self.get_mut() {
             Stream::Tcp(socket) => std::pin::Pin::new(socket).poll_flush(cx),
+            #[cfg(feature = "tls")]
             Stream::Tls(tls) => std::pin::Pin::new(tls.as_mut()).poll_flush(cx),
             Stream::Websocket(ws) => std::pin::Pin::new(ws.as_mut()).poll_flush(cx),
         }
@@ -239,6 +269,7 @@ impl AsyncWrite for Stream {
     ) -> std::task::Poll<std::io::Result<()>> {
         match self.get_mut() {
             Stream::Tcp(socket) => std::pin::Pin::new(socket).poll_shutdown(cx),
+            #[cfg(feature = "tls")]
             Stream::Tls(tls) => std::pin::Pin::new(tls.as_mut()).poll_shutdown(cx),
             Stream::Websocket(ws) => std::pin::Pin::new(ws.as_mut()).poll_shutdown(cx),
         }
@@ -260,6 +291,9 @@ pub async fn connect(dial: &Dial) -> Result<Stream> {
 
     // `wss`: TLS first, then the websocket handshake over the encrypted stream,
     // with the TLS server name standing in for the host in the handshake.
+    // `Dial::from_config` refuses `wss` on a build without the `tls` feature,
+    // so this arm is only reachable with it on.
+    #[cfg(feature = "tls")]
     if dial.protocol == Protocol::Wss {
         let tls = dial
             .tls
@@ -276,6 +310,7 @@ pub async fn connect(dial: &Dial) -> Result<Stream> {
         stream = websocket_over(stream, &dial.addr).await?;
     }
 
+    #[cfg(feature = "tls")]
     if let Some(tls) = dial.tls.as_ref() {
         // Registered before the TLS hook, so it runs before it — and on a
         // `websocket` connection that means inside the websocket stream, which
@@ -303,6 +338,7 @@ async fn websocket_over(inner: Stream, host: &str) -> Result<Stream> {
     Ok(Stream::Websocket(Box::new(ws)))
 }
 
+#[cfg(feature = "tls")]
 /// Wraps `inner` in a TLS client session.
 async fn tls_over(inner: Stream, tls: &Tls) -> Result<Stream> {
     let config = client_config(tls)?;
@@ -327,6 +363,7 @@ async fn tls_over(inner: Stream, tls: &Tls) -> Result<Stream> {
     Ok(Stream::Tls(Box::new(stream)))
 }
 
+#[cfg(feature = "tls")]
 /// Builds the rustls client config, mirroring `NewClientTLSConfig`.
 fn client_config(tls: &Tls) -> Result<Arc<rustls::ClientConfig>> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
@@ -395,6 +432,7 @@ fn client_config(tls: &Tls) -> Result<Arc<rustls::ClientConfig>> {
     Ok(Arc::new(config))
 }
 
+#[cfg(feature = "tls")]
 /// Every certificate in a PEM bundle, skipping anything that is not one.
 ///
 /// `filter_map` rather than `collect::<Result<_, _>>()`: `pem_slice_iter` yields
@@ -407,6 +445,7 @@ fn parse_certificates(pem: &[u8]) -> Vec<rustls::pki_types::CertificateDer<'stat
         .collect()
 }
 
+#[cfg(feature = "tls")]
 /// The first private key in a PEM bundle.
 fn parse_private_key(pem: &[u8]) -> Result<rustls::pki_types::PrivateKeyDer<'static>> {
     use rustls::pki_types::pem::PemObject;
@@ -417,6 +456,7 @@ fn parse_private_key(pem: &[u8]) -> Result<rustls::pki_types::PrivateKeyDer<'sta
     })
 }
 
+#[cfg(feature = "tls")]
 /// Accepts any server certificate, which is what `InsecureSkipVerify = true` is.
 ///
 /// This is not a "skip TLS" switch and it does not weaken the record layer: the
@@ -436,12 +476,14 @@ struct AcceptAnyServerCert {
     provider: Arc<rustls::crypto::CryptoProvider>,
 }
 
+#[cfg(feature = "tls")]
 impl AcceptAnyServerCert {
     fn new(provider: Arc<rustls::crypto::CryptoProvider>) -> Self {
         Self { provider }
     }
 }
 
+#[cfg(feature = "tls")]
 impl rustls::client::danger::ServerCertVerifier for AcceptAnyServerCert {
     fn verify_server_cert(
         &self,
@@ -689,16 +731,25 @@ mod tests {
         }
     }
 
-    /// The three that do dial, so a later regression cannot quietly turn one of
-    /// them back into a config error.
+    /// The ones that do dial, so a later regression cannot quietly turn one of
+    /// them back into a config error. `wss` is absent without the `tls` feature
+    /// and is covered by `a_tls_config_is_refused_by_a_build_without_tls`.
     #[test]
     fn the_implemented_protocols_all_build_a_dial() {
-        for name in ["tcp", "websocket", "wss"] {
+        let protocols: &[&str] = if cfg!(feature = "tls") {
+            &["tcp", "websocket", "wss"]
+        } else {
+            &["tcp", "websocket"]
+        };
+        for name in protocols.iter().copied() {
             let mut common = crate::config::ClientCommonConfig::default();
-            common
-                .transport
-                .get_or_insert_with(Default::default)
-                .protocol = name.into();
+            let transport = common.transport.get_or_insert_with(Default::default);
+            transport.protocol = name.into();
+            // A build without the `tls` feature refuses the default `enable =
+            // true`, which is the subject of its own test below.
+            if !cfg!(feature = "tls") {
+                transport.tls.get_or_insert_with(Default::default).enable = Some(false);
+            }
             let dial = Dial::from_config(&common).unwrap_or_else(|err| panic!("{name}: {err}"));
             assert_eq!(dial.protocol.name(), name);
         }
@@ -717,6 +768,7 @@ mod tests {
     /// `tlsEnable` is forced on for `wss` before the option is read — the Go
     /// client does it in `realConnect`, above the switch that uses it.
     #[test]
+    #[cfg(feature = "tls")]
     fn wss_turns_tls_on_whatever_the_option_says() {
         let mut common = crate::config::ClientCommonConfig::default();
         let transport = common.transport.get_or_insert_with(Default::default);
@@ -732,6 +784,7 @@ mod tests {
 
     /// TLS defaults to on, and `serverName` falls back to `serverAddr`.
     #[test]
+    #[cfg(feature = "tls")]
     fn tls_is_on_by_default_and_borrows_the_server_address() {
         let common = crate::config::ClientCommonConfig {
             server_addr: "frps.example.com".into(),
@@ -749,6 +802,7 @@ mod tests {
     /// An explicit `serverName` wins, which is what makes `tls.force` on a server
     /// behind an address the client does not know work.
     #[test]
+    #[cfg(feature = "tls")]
     fn an_explicit_server_name_is_used_instead() {
         let mut common = crate::config::ClientCommonConfig {
             server_addr: "10.0.0.1".into(),
@@ -777,6 +831,7 @@ mod tests {
     /// websocket hook runs first: TLS is *inside* the websocket there. `wss` is
     /// the one that starts with a ClientHello.
     #[tokio::test]
+    #[cfg(feature = "tls")]
     async fn the_layers_go_on_in_the_order_the_go_hooks_run() {
         /// Dials `dial` against a listener that captures what arrives first.
         async fn first_bytes(mut dial: Dial) -> Vec<u8> {
@@ -860,6 +915,55 @@ mod tests {
         );
     }
 
+    /// Without the `tls` feature the client refuses, rather than connecting in
+    /// the clear.
+    ///
+    /// This is the whole safety argument for making TLS optional: `enable`
+    /// defaults to **true**, so a build that quietly ignored it would turn a
+    /// size optimisation into a plaintext tunnel. The refusal has to be loud
+    /// enough to say what to do about it.
+    #[cfg(not(feature = "tls"))]
+    #[test]
+    fn a_tls_config_is_refused_by_a_build_without_tls() {
+        // The default config: `transport.tls.enable` is unset, which means on.
+        let err = Dial::from_config(&crate::config::ClientCommonConfig::default()).unwrap_err();
+        assert!(matches!(err, Error::Config(_)), "{err}");
+        let text = err.to_string();
+        assert!(text.contains("transport.tls.enable = false"), "{text}");
+        assert!(text.contains("`tls` feature"), "{text}");
+
+        // And `wss`, which is a websocket inside TLS and cannot work either.
+        let mut common = crate::config::ClientCommonConfig::default();
+        common
+            .transport
+            .get_or_insert_with(Default::default)
+            .protocol = "wss".into();
+        let err = Dial::from_config(&common).unwrap_err();
+        assert!(matches!(err, Error::Config(_)), "{err}");
+        assert!(err.to_string().contains("wss"), "{err}");
+
+        // Asking for it explicitly is refused the same way.
+        let mut common = crate::config::ClientCommonConfig::default();
+        common
+            .transport
+            .get_or_insert_with(Default::default)
+            .tls
+            .get_or_insert_with(Default::default)
+            .enable = Some(true);
+        assert!(Dial::from_config(&common).is_err());
+
+        // Turning it off is what a no-TLS build is for, and it works.
+        let mut common = crate::config::ClientCommonConfig::default();
+        common
+            .transport
+            .get_or_insert_with(Default::default)
+            .tls
+            .get_or_insert_with(Default::default)
+            .enable = Some(false);
+        let dial = Dial::from_config(&common).expect("a plain dial");
+        assert!(dial.tls.is_none());
+    }
+
     /// A name has to reach the resolver, not the address parser.
     ///
     /// This is the bug that made `serverAddr = "host.example.com"` fail with
@@ -899,6 +1003,7 @@ mod tests {
     /// for, and it is the one case that is silently wrong if the flag is read
     /// backwards.
     #[tokio::test]
+    #[cfg(feature = "tls")]
     async fn the_tls_head_byte_is_written_only_when_asked_for() {
         async fn first_bytes(disable: bool) -> Vec<u8> {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

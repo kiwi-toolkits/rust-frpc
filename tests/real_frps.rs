@@ -36,6 +36,7 @@ const CONTROL_PORT: u16 = 17_000;
 const CONTROL_PORT_NO_MUX: u16 = 17_100;
 /// Must match tests/fixtures/frps-integration-tls.toml, whose server refuses
 /// anything that is not a TLS handshake.
+#[cfg(feature = "tls")]
 const CONTROL_PORT_TLS: u16 = 17_200;
 /// The public port the multiplexed round-trip test asks `frps` to open.
 /// Deliberately away from the control ports and from anything a developer is
@@ -44,6 +45,7 @@ const REMOTE_PORT: u16 = 17_200;
 /// The same for the non-multiplexed round trip.
 const REMOTE_PORT_NO_MUX: u16 = 17_201;
 /// The same for the TLS round trip, which runs against its own server.
+#[cfg(feature = "tls")]
 const REMOTE_PORT_TLS: u16 = 17_202;
 /// The same for the websocket round trips.
 const REMOTE_PORT_WS: u16 = 17_203;
@@ -86,6 +88,7 @@ fn frps_without_mux() -> Option<(String, String)> {
     Some((bin, no_mux))
 }
 
+#[cfg(feature = "tls")]
 /// The same, but for the fixture that forces TLS.
 ///
 /// `transport.tls.force` makes frps reject a plain connection outright, so this
@@ -136,6 +139,22 @@ fn client_config() -> config::ClientConfig {
         ..Default::default()
     });
     config.complete();
+    // A stock `frps` accepts either, so the suite follows the build: with the
+    // `tls` feature every test below dials TLS, which is frp's default, and
+    // without it they dial plain — because a build with no TLS support refuses
+    // a config that asks for some, including its own default. The tests that
+    // are *about* TLS say so themselves and are gated on the feature.
+    if !cfg!(feature = "tls") {
+        config
+            .common
+            .transport
+            .as_mut()
+            .unwrap()
+            .tls
+            .as_mut()
+            .unwrap()
+            .enable = Some(false);
+    }
     config
 }
 
@@ -796,6 +815,7 @@ async fn connect_muxer(domain: &str) -> std::result::Result<TcpStream, String> {
     }
 }
 
+#[cfg(feature = "tls")]
 /// A `tls.force` server, which is the test a plain-TCP-only client cannot pass.
 ///
 /// `transport.tls.enable` defaults to **true**, so TLS is the path a stock
@@ -833,6 +853,7 @@ async fn real_frps_accepts_a_login_over_tls() {
     let _ = frps.kill().await;
 }
 
+#[cfg(feature = "tls")]
 /// The same server, with TLS turned off: the client must be refused.
 ///
 /// Without this half, a client that quietly ignored `transport.tls.enable` and
@@ -872,6 +893,7 @@ async fn real_frps_refuses_a_plain_login_to_a_tls_server() {
     let _ = frps.kill().await;
 }
 
+#[cfg(feature = "tls")]
 /// A `tcp` round trip over TLS, so the whole stack — yamux inside a TLS session,
 /// every work connection and the bridge — is exercised on the default path.
 #[tokio::test]

@@ -156,6 +156,22 @@ fn write_config(path: &PathBuf, count: u16, local_port: u16) {
         ));
     }
     config.complete();
+    // The config is written to disk and handed to whichever `frpc` `FRPC_BIN`
+    // names, so it has to be one that build will accept. `transport.tls.enable`
+    // defaults to true, and a binary built with `--no-default-features` refuses
+    // that rather than connecting in the clear — which is the point of the
+    // refusal, but it means the harness follows the build it is testing.
+    if !cfg!(feature = "tls") {
+        config
+            .common
+            .transport
+            .as_mut()
+            .unwrap()
+            .tls
+            .as_mut()
+            .unwrap()
+            .enable = Some(false);
+    }
 
     let text = toml::to_string_pretty(&config).expect("render the config");
     std::fs::write(path, text).expect("write the config");

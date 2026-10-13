@@ -7,8 +7,20 @@
 #   cargo install cargo-zigbuild
 #
 # See doc/build-linux-arm.md for the zig setup.
+#
+#   build-arm.ps1 [-NoTls]
+#
+# -NoTls builds with --no-default-features, which drops rustls and ring and takes
+# the armv7 artefact from 2.06 MB to 1.54 MB. It is opt-in rather than the
+# default because frp's own default config asks for TLS, and a client built
+# without it refuses to start on that config rather than connecting in the
+# clear. The refusal names the way out (`transport.tls.enable = false`).
+
+param([switch]$NoTls)
 
 $ErrorActionPreference = "Stop"
+
+$features = if ($NoTls) { @("--no-default-features") } else { @() }
 
 $targets = @(
     "armv7-unknown-linux-musleabihf",
@@ -46,7 +58,7 @@ Push-Location $projectRoot
 try {
     foreach ($target in $targets) {
         Write-Host "==> $target"
-        cargo zigbuild --release --target $target --bin frpc --bin rust-frpc
+        cargo zigbuild --release --target $target --bin frpc --bin rust-frpc @features
         if ($LASTEXITCODE -ne 0) { throw "build failed for $target" }
     }
 
