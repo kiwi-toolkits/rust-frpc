@@ -196,6 +196,7 @@ release profile 面向体积（`opt-level = "z"`、fat LTO、`strip`、`panic = 
 ```bash
 cargo build --release --no-default-features   # 本机 1.41 MB
 scripts/build-arm.sh --no-tls                 # armv7: 2.06 MB -> 1.56 MB
+scripts/build-arm.ps1 -NoTls                  # Windows 上等价
 ```
 
 | 目标 | 含 TLS | `--no-tls` |

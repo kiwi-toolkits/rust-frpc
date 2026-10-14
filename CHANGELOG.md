@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+* **`build-arm.ps1` silently ignored `--no-tls`, and then failed to build at
+  all with it.** Two separate bugs in one flag, both of which produced a binary
+  the caller had not asked for. PowerShell binds `-NoTls` but leaves `--no-tls`
+  in `$args`, and the script read neither — so the familiar spelling built *with*
+  TLS and said nothing, turning a requested 1.56 MB into 2.06 MB. That is the
+  one-line difference between PowerShell's convention and every other tool's, so
+  both spellings are accepted now and anything unrecognised is refused instead
+  of dropped.
+* **And the flag could not have worked anyway when it did bind.**
+  `$features = if ($NoTls) { @("--no-default-features") } else { @() }` does not
+  produce an array: an `if` emits to the pipeline, the pipeline enumerates, and a
+  one-element array comes back as a bare `String` — one whose `.Count` is still
+  1 and which still prints correctly. Splatting that with `@features` enumerates
+  its *characters*, and the first character of `--no-default-features` is `-`, so
+  `cargo-zigbuild` was handed a lone `-` as a positional argument and exited with
+  `error: unexpected argument '-' found`. The script now builds a `[string[]]`
+  and appends to it.
+* **The ARM scripts also clear the environment overrides they used to set.** An
+  `$env:` assignment outlives the script that made it, so a shell which ran an
+  older `build-arm.ps1` still has `CARGO_PROFILE_RELEASE_LTO=off` set — and that
+  silently overrides the release profile, which is 610 kB of fat LTO. A build
+  from such a shell came out at 2.67 MB while the docs said 2.06. Both variables
+  are now cleared with a warning that names them.
+* **`build-arm.ps1` reports decimal MB.** It used `1MB`, which is 1048576 in
+  PowerShell, so a 1.56 MB artefact printed as 1.49 and did not match the README
+  it was being compared against. Every line now says which mode it is building —
+  `==> armv7-unknown-linux-musleabihf (tls: no)` — so the one thing that was
+  invisible is the first thing on screen.
+
 * **A `tls` feature, on by default, so a build can leave TLS out.** It is the
   only thing that removes the `rustls` and `ring` cost, and it takes
   `armv7-unknown-linux-musleabihf` from 2.06 MB to **1.56 MB** — which is where

@@ -7,7 +7,8 @@ libc, so one binary runs on any rootfs.
 ## Leaving TLS out
 
 ```bash
-scripts/build-arm.sh --no-tls      # or: scripts/build-arm.ps1 -NoTls
+scripts/build-arm.sh --no-tls          # Linux/macOS
+scripts/build-arm.ps1 -NoTls           # Windows; --no-tls works too
 ```
 
 `--no-tls` passes `--no-default-features`, which drops `rustls`, `ring` and

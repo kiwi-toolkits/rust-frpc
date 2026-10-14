@@ -19,7 +19,7 @@
 #   build-arm.sh [--no-tls]
 #
 # `--no-tls` builds with `--no-default-features`, which drops `rustls` and `ring`
-# and takes the armv7 artefact from 2.06 MB to 1.54 MB. It is opt-in rather than
+# and takes the armv7 artefact from 2.06 MB to 1.56 MB. It is opt-in rather than
 # the default because frp's own default config asks for TLS, and a client built
 # without it refuses to start on that config rather than connecting in the
 # clear. The refusal names the way out (`transport.tls.enable = false`).

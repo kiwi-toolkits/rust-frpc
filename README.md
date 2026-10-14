@@ -232,6 +232,7 @@ that removes the rest of that:
 ```bash
 cargo build --release --no-default-features   # 1.41 MB natively
 scripts/build-arm.sh --no-tls                 # armv7: 2.06 MB -> 1.56 MB
+scripts/build-arm.ps1 -NoTls                  # the same on Windows
 ```
 
 | target | with TLS | `--no-tls` |
