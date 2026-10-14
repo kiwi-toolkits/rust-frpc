@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+* **`rust-frpc.0.1.0` was rejected by any `frps` up to 0.54.** The version string
+  in `Login` is not decoration: those servers call `version.Compat`, which splits
+  it on `.` and compares field *n* against field *n* of `0.18.0`. A string whose
+  first field is not a number makes that field zero — a tie — and pushes the
+  crate's own `0` into the field compared against `18`. It loses, and the server
+  answers `Please upgrade your frpc version to at least 0.18.0` and closes. The
+  string is now `0.71.0-rust-frpc.0.1.0`: the leading number is the frp release
+  this client implements, and the suffix still tells an operator which client
+  is which in `frps`'s dashboard. Verified rather than reasoned about — a real
+  `frps` 0.44 rejects the old string, accepts the new one, and that comparison
+  is the whole difference. `frps` dropped the check in 0.55, which is why this
+  went unnoticed: every server the suite ran against was too new to care.
+  `the_version_clears_the_floor_old_servers_apply` reproduces the comparison
+  rather than pattern-matching the string, and fails against the old one.
+* **`frpc -v` therefore prints `0.71.0-rust-frpc.0.1.0`.** The Go client prints
+  a bare `0.61.0`; this remains a deliberate difference, now for a reason that
+  is recorded rather than assumed.
+
 * **`build-arm.ps1` silently ignored `--no-tls`, and then failed to build at
   all with it.** Two separate bugs in one flag, both of which produced a binary
   the caller had not asked for. PowerShell binds `-NoTls` but leaves `--no-tls`
