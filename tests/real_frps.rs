@@ -443,7 +443,16 @@ async fn start_http_echo() -> u16 {
 /// `frps`'s vhost listener is up from startup, so a connect says nothing about
 /// whether a proxy has been registered on it; only the response does.
 async fn http_get_until_ok(host: String, path: &str) -> String {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    http_get_until_ok_within(host, path, Duration::from_secs(10)).await
+}
+
+/// The same, with the deadline spelled out.
+///
+/// A proxy that has to rename itself first takes several seconds of deliberate
+/// retrying — two attempts at the configured name and then a candidate — so the
+/// default that suits an ordinary proxy is too short to read anything into.
+async fn http_get_until_ok_within(host: String, path: &str, patience: Duration) -> String {
+    let deadline = tokio::time::Instant::now() + patience;
     loop {
         match http_get(host.clone(), path).await {
             Ok(body) => return body,
@@ -710,6 +719,68 @@ async fn real_frps_routes_an_http_request_by_host() {
     assert_eq!(body, "http-ok:/status");
 
     client.stop().await;
+    let _ = frps.kill().await;
+}
+
+/// Two clients claiming the same name: the second one renames itself and comes up.
+///
+/// This is the case the strategy exists for. A device running a client that
+/// registers `hq<id>` refuses a second one forever under upstream frpc, which
+/// re-sends the same name every thirty seconds and never gets in. Here the second
+/// should land on `r1_web` — **and the domain has to move with it**, because an
+/// `http` proxy whose name changed but whose `subdomain` did not would register
+/// under the new name and still collide on the host.
+#[tokio::test]
+#[ignore = "needs a real frps: set RUN_REAL_FRPS_TESTS=1, FRPS_BIN and FRPS_CONFIG"]
+async fn real_frps_renames_a_proxy_whose_name_is_taken() {
+    let Some((bin, config_path)) = frps() else {
+        return;
+    };
+    let mut frps = start(&bin, &config_path);
+    wait_for_port(CONTROL_PORT, Duration::from_secs(10)).await;
+
+    // The first client takes `web` and `web.<subDomainHost>`.
+    let first_port = start_http_echo().await;
+    let first = spawn_client(client_config_with_http_proxy(first_port, "web"));
+    wait_for_port(VHOST_PORT, Duration::from_secs(10)).await;
+    assert_eq!(
+        http_get_until_ok(format!("web.{SUBDOMAIN_HOST}"), "/").await,
+        "http-ok:/"
+    );
+
+    // The second asks for the same name and the same subdomain.
+    let second_port = start_http_echo().await;
+    let second = spawn_client(client_config_with_http_proxy(second_port, "web"));
+
+    // One assertion covers both halves. `r1_web.<host>` exists only if the proxy
+    // registered under the new *name* and claimed the new *domain*: frps routes
+    // a vhost request by host alone, so a rename that left the subdomain behind
+    // would leave this host unrouted.
+    //
+    // The patience is longer than the helper's default because the client
+    // deliberately waits three seconds between attempts: two at the configured
+    // name, then the first candidate.
+    assert_eq!(
+        http_get_until_ok_within(
+            format!("r1_web.{SUBDOMAIN_HOST}"),
+            "/",
+            Duration::from_secs(30)
+        )
+        .await,
+        "http-ok:/"
+    );
+
+    // And the client that got there first is untouched — renaming the *other*
+    // one must not take a working tunnel away.
+    assert_eq!(
+        http_get(format!("web.{SUBDOMAIN_HOST}"), "/")
+            .await
+            .expect("the first client's proxy should still be routed"),
+        "http-ok:/"
+    );
+
+    first.stop().await;
+    second.stop().await;
     let _ = frps.kill().await;
 }
 

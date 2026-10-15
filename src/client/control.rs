@@ -37,6 +37,7 @@ use crate::proto::{Connector, LogicalConn};
 use super::bridge::{self, WorkConnTransport};
 use super::login::{signs_heartbeats, signs_new_work_conns};
 use super::proxy::to_new_proxy;
+use super::rename::{self, Candidate};
 use super::session::{SessionControl, SessionEvents};
 
 /// How long to wait for a `NewProxyResp` before announcing the proxy again.
@@ -201,6 +202,103 @@ impl Drop for ReaderTask {
     }
 }
 
+/// What a proxy is registered as, which is not always what the config says.
+///
+/// The configured name is the key everywhere an operator looks — the status map,
+/// the admin API, the log prefix. The *candidate* is what `NewProxy` carries, and
+/// the rename-retry strategy moves it. They differ only after a conflict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Registered {
+    configured: String,
+    candidate: Candidate,
+    /// How many times the current candidate has been tried and refused.
+    tries: u32,
+    /// The name `frps` last confirmed, if any. Only this can be closed.
+    acked: Option<String>,
+    /// When the conflict path may send again, or `None` to use the ordinary
+    /// [`REGISTER_TIMEOUT`].
+    ///
+    /// Conflicts pace themselves: three seconds a step, sixty before a new
+    /// cycle. An ordinary start error waits twenty. Keeping the two in one field
+    /// is what stops either from delaying the other.
+    retry_at: Option<Instant>,
+}
+
+impl Registered {
+    /// Whether `local_name` is a name this proxy has answered to.
+    ///
+    /// Three of them, because a response can be in flight while the name
+    /// changes: the candidate being tried now, the configured name, and whatever
+    /// the server last confirmed.
+    fn answers_to(&self, local_name: &str) -> bool {
+        local_name == self.candidate.name(&self.configured)
+            || local_name == self.configured
+            || self.acked.as_deref() == Some(local_name)
+    }
+}
+
+/// What a failed registration asks the loop to do next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConflictAction {
+    /// Nothing of its own: the ordinary retry timer owns this proxy.
+    Leave,
+    /// Try the same name again after `delay`.
+    RetrySame { delay: Duration },
+    /// Try under a new candidate after `delay`.
+    RetryAs {
+        candidate: Candidate,
+        delay: Duration,
+    },
+}
+
+/// Whether a failed registration is really this client's own duplicate coming
+/// back.
+///
+/// `frps` refuses a name that is in use **without checking who holds it**
+/// (`PxyManager.Exist`), so a second `NewProxy` for a name that already succeeded
+/// is answered with `already exists`. The retry timer can produce exactly that,
+/// because it fires on a three-second tick and the answer to the first attempt
+/// may still be queued. Treating it as a conflict would rename a tunnel that is
+/// working, which is the worst answer available — hence a predicate of its own,
+/// named after what it is for.
+fn is_our_own_duplicate(phase: ProxyPhase, error: &str) -> bool {
+    phase == ProxyPhase::Running && rename::conflicts(error)
+}
+
+/// Decides whether a failed registration should be retried, and under what name.
+///
+/// Pulled out of the loop so it can be tested: `Control` cannot be built without
+/// a live session, and this is the part with the sequence in it.
+///
+/// `running` is the phase *before* this failure was recorded. A conflict on a
+/// proxy that is already running is the client's own duplicate registration
+/// coming back — `frps` refuses a name that is in use without checking who owns
+/// it — and renaming a working tunnel because of it would be the worst possible
+/// response. See the caller, which drops that case before getting here.
+fn on_start_error(
+    registered: &mut Registered,
+    rename_enabled: bool,
+    error: &str,
+) -> ConflictAction {
+    if !rename_enabled || !rename::conflicts(error) {
+        return ConflictAction::Leave;
+    }
+
+    registered.tries += 1;
+    if registered.tries < registered.candidate.tries_allowed() {
+        return ConflictAction::RetrySame {
+            delay: rename::CONFLICT_RETRY_DELAY,
+        };
+    }
+
+    registered.tries = 0;
+    registered.candidate = rename::advance(registered.candidate);
+    ConflictAction::RetryAs {
+        candidate: registered.candidate,
+        delay: rename::delay_after_advancing(registered.candidate),
+    }
+}
+
 /// The control loop.
 pub struct Control {
     config: ClientConfig,
@@ -222,6 +320,24 @@ pub struct Control {
     /// Behind an `Arc` so the per-connection task can look its own proxy up
     /// without copying the whole list.
     proxies: Arc<[ProxyConfig]>,
+    /// What each proxy is currently registered as, parallel to `proxies`.
+    names: Vec<Registered>,
+    /// The same list, published for the work-connection tasks.
+    ///
+    /// A `watch` rather than a copy handed over at spawn time, because a work
+    /// connection is not used when it is opened. `frps` pools it — `poolCount`
+    /// of them are held ready — and the `StartWorkConn` that names a proxy comes
+    /// back only when a user takes one out of that pool, which can be minutes
+    /// later and after a rename. A task that resolved against the list it was
+    /// spawned with would look up a name that is no longer current and drop the
+    /// connection, leaving the user hanging with a warning to show for it.
+    ///
+    /// The task reads this once, when the answer arrives, and the guard is a
+    /// `Ref` held for a clone of an `Arc` — never across an `.await`. That
+    /// restraint matters more here than elsewhere: `run` is awaited rather than
+    /// spawned and so carries no `Send` bound, which means a guard held across
+    /// an await would stall the executor instead of failing to compile.
+    names_tx: watch::Sender<Arc<[Registered]>>,
     /// When each proxy was last announced, for the retry timer.
     announced_at: BTreeMap<String, Instant>,
     /// Set by the read half when a `Pong` arrives.
@@ -290,6 +406,18 @@ impl Control {
             })
             .collect();
 
+        let names: Vec<Registered> = proxies
+            .iter()
+            .map(|proxy| Registered {
+                configured: proxy.name.clone(),
+                candidate: Candidate::Original,
+                tries: 0,
+                acked: None,
+                retry_at: None,
+            })
+            .collect();
+        let (names_tx, _names_rx) = watch::channel::<Arc<[Registered]>>(names.clone().into());
+
         Self {
             config,
             control,
@@ -299,6 +427,8 @@ impl Control {
             run_id,
             statuses,
             proxies: proxies.into(),
+            names,
+            names_tx,
             announced_at: BTreeMap::new(),
             last_pong: None,
             status_tx,
@@ -503,17 +633,32 @@ impl Control {
     /// Announces the proxy at `index`, recording the phase change.
     async fn announce(&mut self, index: usize) -> Result<()> {
         let proxy = self.proxies[index].clone();
-        let message = to_new_proxy(&self.config, &proxy, &proxy.name);
+        let candidate = self.names[index].candidate;
+        let message = to_new_proxy(&self.config, &proxy, candidate);
 
         if let Some(status) = self.statuses.get_mut(&proxy.name) {
             status.phase = ProxyPhase::WaitStart;
             status.error.clear();
         }
+        // Keyed by the configured name, which never changes. Keying it by the
+        // wire name would make `retry_pending`'s lookup below miss forever, and
+        // nothing would ever be re-announced again.
         self.announced_at.insert(proxy.name.clone(), Instant::now());
+        self.names[index].retry_at = None;
 
         self.control
             .send(&Message::NewProxy(Box::new(message)))
             .await
+    }
+
+    /// Republishes the names the work-connection tasks resolve against.
+    ///
+    /// Called whenever one changes — a candidate advancing, or a registration
+    /// being acknowledged. `send_replace` rather than `send`, because between
+    /// two work connections there may be no receiver at all and `send` would
+    /// then silently do nothing.
+    fn publish_names(&self) {
+        self.names_tx.send_replace(self.names.clone().into());
     }
 
     /// Re-announces anything the server has not acknowledged, which is how a
@@ -524,13 +669,21 @@ impl Control {
             .proxies
             .iter()
             .enumerate()
-            .filter(|(_, proxy)| match self.statuses.get(&proxy.name) {
+            .filter(|(index, proxy)| match self.statuses.get(&proxy.name) {
                 Some(status) => match status.phase {
                     ProxyPhase::New => true,
-                    ProxyPhase::WaitStart | ProxyPhase::StartError => self
-                        .announced_at
-                        .get(&proxy.name)
-                        .is_some_and(|at| now.duration_since(*at) > REGISTER_TIMEOUT),
+                    ProxyPhase::WaitStart | ProxyPhase::StartError => {
+                        match self.names[*index].retry_at {
+                            // The conflict path paces itself — three seconds a
+                            // step, sixty before a new cycle — and that schedule
+                            // is the whole point of the field.
+                            Some(at) => now >= at,
+                            None => self
+                                .announced_at
+                                .get(&proxy.name)
+                                .is_some_and(|at| now.duration_since(*at) > REGISTER_TIMEOUT),
+                        }
+                    }
                     ProxyPhase::Running => false,
                 },
                 None => false,
@@ -554,16 +707,27 @@ impl Control {
     /// Sends `CloseProxy` for every proxy, so the server releases ports promptly
     /// instead of waiting for the control connection to time out.
     async fn deregister_all(&mut self) {
-        for proxy in self.proxies.iter() {
+        for registered in self.names.iter() {
+            // Only a name the server confirmed. `frps` resolves `CloseProxy`
+            // against this control connection's own proxies, so a name that was
+            // never registered is a no-op — and a proxy that never came up has
+            // nothing to release. The server reaps a control connection's
+            // proxies when it ends anyway.
+            let Some(acked) = registered.acked.as_deref() else {
+                continue;
+            };
             let message = CloseProxy {
-                proxy_name: naming::add_user_prefix(&self.config.common.user, &proxy.name),
+                proxy_name: naming::add_user_prefix(&self.config.common.user, acked),
             };
             if let Err(err) = self
                 .control
                 .send(&Message::CloseProxy(Box::new(message)))
                 .await
             {
-                logging::debug(format!("could not close proxy {}: {err}", proxy.name));
+                logging::debug(format!(
+                    "could not close proxy {}: {err}",
+                    registered.configured
+                ));
                 return;
             }
         }
@@ -607,12 +771,20 @@ impl Control {
     }
 
     fn handle_new_proxy_resp(&mut self, resp: NewProxyResp) {
-        let name = naming::strip_user_prefix(&self.config.common.user, &resp.proxy_name);
-        let Some(status) = self.statuses.get_mut(&name) else {
-            logging::warn(format!("the server answered for unknown proxy {name}"));
+        let local = naming::strip_user_prefix(&self.config.common.user, &resp.proxy_name);
+        // Matched on the wire name rather than the configured one: after a
+        // rename the server answers for `r1_hq1925369`, which is no proxy's
+        // configured name.
+        let Some(index) = self
+            .names
+            .iter()
+            .position(|registered| registered.answers_to(&local))
+        else {
+            logging::warn(format!("the server answered for unknown proxy {local}"));
             return;
         };
-        let log = logging::Prefixed::new(&name);
+        let configured = self.names[index].configured.clone();
+        let log = logging::Prefixed::new(&configured);
 
         if resp.error.is_empty() {
             // The remote address is this client's addition: frp's own line is
@@ -622,13 +794,59 @@ impl Control {
                 "start proxy success, remote address: {}",
                 resp.remote_addr
             ));
-            status.phase = ProxyPhase::Running;
-            status.remote_addr = resp.remote_addr;
-            status.error.clear();
-        } else {
-            log.warn(format!("start error: {}", resp.error));
+            self.names[index].acked = Some(local);
+            self.names[index].retry_at = None;
+            self.publish_names();
+            if let Some(status) = self.statuses.get_mut(&configured) {
+                status.phase = ProxyPhase::Running;
+                status.remote_addr = resp.remote_addr;
+                status.error.clear();
+            }
+            return;
+        }
+
+        // A conflict reported against a proxy that is already running is this
+        // client's own duplicate registration coming back. `frps` refuses a name
+        // that is in use without checking who holds it, so a second `NewProxy`
+        // for a name that already succeeded is answered with `already exists` —
+        // and there is a window for exactly that, because the retry timer can
+        // fire again while the first answer is still queued. Treating it as a
+        // real conflict would rename a tunnel that is working.
+        let phase_before = self
+            .statuses
+            .get(&configured)
+            .map_or(ProxyPhase::New, |status| status.phase);
+        if is_our_own_duplicate(phase_before, &resp.error) {
+            logging::debug(format!(
+                "ignoring a duplicate registration answer for {configured}"
+            ));
+            return;
+        }
+
+        log.warn(format!("start error: {}", resp.error));
+        if let Some(status) = self.statuses.get_mut(&configured) {
             status.phase = ProxyPhase::StartError;
-            status.error = resp.error;
+            status.error = resp.error.clone();
+        }
+
+        let rename_enabled = self.config.rename_on_conflict();
+        let action = on_start_error(&mut self.names[index], rename_enabled, &resp.error);
+        match action {
+            ConflictAction::Leave => {}
+            ConflictAction::RetrySame { delay } => {
+                logging::debug(format!(
+                    "{configured} is taken; trying the same name again in {delay:?}"
+                ));
+                self.names[index].retry_at = Some(Instant::now() + delay);
+            }
+            ConflictAction::RetryAs { candidate, delay } => {
+                log.warn(format!(
+                    "proxy [{configured}] already exists; retrying as [{}] in {delay:?}",
+                    candidate.name(&configured)
+                ));
+                self.names[index].retry_at = Some(Instant::now() + delay);
+                self.publish_names();
+            }
         }
     }
 
@@ -645,6 +863,7 @@ impl Control {
         let connector = self.connector.clone();
         let run_id = self.run_id.clone();
         let proxies = self.proxies.clone();
+        let names = self.names_tx.subscribe();
         let user = self.config.common.user.clone();
         let signed = signs_new_work_conns(&self.config);
         let secret = self.token();
@@ -658,6 +877,7 @@ impl Control {
                 connector,
                 run_id,
                 proxies,
+                names,
                 &user,
                 signed,
                 secret,
@@ -750,6 +970,7 @@ async fn open_work_conn(
     connector: Connector,
     run_id: String,
     proxies: Arc<[ProxyConfig]>,
+    names: watch::Receiver<Arc<[Registered]>>,
     user: &str,
     signed: bool,
     secret: String,
@@ -794,10 +1015,19 @@ async fn open_work_conn(
         return Err(Error::Rejected(start.error));
     }
 
-    let name = naming::strip_user_prefix(user, &start.proxy_name);
-    let Some(proxy) = proxies
+    let local = naming::strip_user_prefix(user, &start.proxy_name);
+    // Read now, not when the task was spawned: this connection may have been
+    // sitting in the server's pool since before a rename.
+    let names = names.borrow().clone();
+    // Matched against every name the proxy answers to, not just the one it is
+    // registered under now: the server may hand over a connection for a name that
+    // was current when it queued the request, and the rename can have happened
+    // since. Getting this wrong drops the work connection, so the user's own
+    // connection hangs until it times out with only a warning to show for it.
+    let Some((proxy, registered)) = proxies
         .iter()
-        .find(|proxy| naming::add_user_prefix(user, &proxy.name) == start.proxy_name)
+        .zip(names.iter())
+        .find(|(_, registered)| registered.answers_to(&local))
     else {
         logging::warn(format!(
             "the server sent a connection for unknown proxy {}",
@@ -805,6 +1035,9 @@ async fn open_work_conn(
         ));
         return Ok(());
     };
+    // Reported under the configured name, which is what the admin API and the
+    // status list use, so a rename does not make a proxy's events change identity.
+    let name = registered.configured.clone();
 
     let transport = transport_of(proxy);
 
@@ -978,4 +1211,176 @@ pub(crate) fn describe(message: &Message) -> &'static str {
 /// Whether a control-loop failure should be retried or reported.
 pub fn should_reconnect(error: &Error) -> bool {
     is_retryable(error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn registered() -> Registered {
+        Registered {
+            configured: "web".to_string(),
+            candidate: Candidate::Original,
+            tries: 0,
+            acked: None,
+            retry_at: None,
+        }
+    }
+
+    /// One refused registration, as the loop would see it: run the decision, then
+    /// report the name that will be sent next and the wait in front of it.
+    fn refused(reg: &mut Registered) -> (String, Duration) {
+        match on_start_error(reg, true, "proxy [web] already exists") {
+            ConflictAction::Leave => panic!("a conflict must not be left alone"),
+            ConflictAction::RetrySame { delay } => (reg.candidate.name(&reg.configured), delay),
+            ConflictAction::RetryAs { candidate, delay } => {
+                assert_eq!(
+                    candidate, reg.candidate,
+                    "the action must describe the new state"
+                );
+                (candidate.name(&reg.configured), delay)
+            }
+        }
+    }
+
+    /// The sequence, and the pacing, are the feature — so both are asserted.
+    ///
+    /// Each entry is **the name of the next attempt and the wait in front of
+    /// it**, so the original appears once per cycle rather than twice: the first
+    /// attempt is the starting state, and its refusal is what produces the second
+    /// attempt's entry. Read as attempts the walk is
+    /// `original, original, r1_, r2_, r3_` — two tries for the configured name,
+    /// one for each candidate — and only the step that returns to the original
+    /// waits a minute.
+    #[test]
+    fn the_conflict_walk_matches_the_agreed_sequence() {
+        let mut reg = registered();
+        let seen: Vec<(String, Duration)> = (0..15).map(|_| refused(&mut reg)).collect();
+
+        let short = rename::CONFLICT_RETRY_DELAY;
+        let long = rename::CYCLE_RESTART_DELAY;
+        let cycle = vec![
+            ("web".to_string(), short),
+            ("r1_web".to_string(), short),
+            ("r2_web".to_string(), short),
+            ("r3_web".to_string(), short),
+            ("web".to_string(), long),
+        ];
+        let mut expected = cycle.clone();
+        expected.extend(cycle.clone());
+        expected.extend(cycle);
+        assert_eq!(seen, expected);
+    }
+
+    /// Each candidate really does get only the attempts it is allowed, counted
+    /// from the state rather than from the shape of the list above.
+    #[test]
+    fn each_candidate_gets_exactly_its_attempts() {
+        let mut reg = registered();
+        // Two refusals of the configured name before the first rename: the first
+        // keeps it, the second advances.
+        refused(&mut reg);
+        assert_eq!(reg.candidate, Candidate::Original);
+        refused(&mut reg);
+        assert_eq!(reg.candidate, Candidate::Renamed(1));
+
+        // And one refusal per candidate after that.
+        for expected in [2, 3] {
+            refused(&mut reg);
+            assert_eq!(reg.candidate, Candidate::Renamed(expected));
+        }
+        refused(&mut reg);
+        assert_eq!(
+            reg.candidate,
+            Candidate::Original,
+            "r3_ hands back to the original"
+        );
+    }
+
+    /// The configured name is what an operator sees; only the candidate moves.
+    #[test]
+    fn the_configured_name_never_changes() {
+        let mut reg = registered();
+        for _ in 0..12 {
+            refused(&mut reg);
+        }
+        assert_eq!(reg.configured, "web");
+    }
+
+    /// A renamed proxy still answers to its configured name, and to what the
+    /// server confirmed — a work connection can arrive for either while a rename
+    /// is in flight.
+    #[test]
+    fn a_proxy_answers_to_every_name_it_has_used() {
+        let mut reg = registered();
+        assert!(reg.answers_to("web"));
+        assert!(!reg.answers_to("r1_web"));
+
+        reg.candidate = Candidate::Renamed(1);
+        assert!(reg.answers_to("r1_web"), "the candidate being tried");
+        assert!(reg.answers_to("web"), "and still the configured name");
+
+        reg.acked = Some("r2_web".to_string());
+        assert!(reg.answers_to("r2_web"), "and whatever was confirmed");
+    }
+
+    #[test]
+    fn turning_the_strategy_off_leaves_everything_alone() {
+        let mut reg = registered();
+        assert_eq!(
+            on_start_error(&mut reg, false, "proxy [web] already exists"),
+            ConflictAction::Leave
+        );
+        assert_eq!(reg.candidate, Candidate::Original);
+        assert_eq!(reg.tries, 0, "a disabled strategy must not use up tries");
+    }
+
+    /// A start failure that is not a conflict must keep the twenty-second path.
+    /// Renaming because a local service is down would trade one fault for a
+    /// stranger one.
+    #[test]
+    fn other_failures_are_left_to_the_ordinary_retry() {
+        for error in ["port already used", "connect to local service error", ""] {
+            let mut reg = registered();
+            assert_eq!(
+                on_start_error(&mut reg, true, error),
+                ConflictAction::Leave,
+                "{error:?}"
+            );
+        }
+    }
+
+    /// A success stops the walk: the candidate stays where it landed.
+    #[test]
+    fn a_candidate_that_works_stays() {
+        let mut reg = registered();
+        refused(&mut reg);
+        refused(&mut reg);
+        assert_eq!(reg.candidate, Candidate::Renamed(1));
+        // Nothing else calls `on_start_error`, so the state is simply left here.
+        assert_eq!(reg.tries, 0);
+    }
+
+    /// Our own duplicate registration must not be mistaken for a conflict.
+    #[test]
+    fn a_running_proxy_ignores_its_own_duplicate() {
+        assert!(is_our_own_duplicate(
+            ProxyPhase::Running,
+            "proxy [web] already exists"
+        ));
+        assert!(is_our_own_duplicate(
+            ProxyPhase::Running,
+            "router config conflict"
+        ));
+        // Before the name is ours, the same message is a real conflict.
+        assert!(!is_our_own_duplicate(
+            ProxyPhase::WaitStart,
+            "proxy [web] already exists"
+        ));
+        // And a running proxy's other failures are real failures.
+        assert!(!is_our_own_duplicate(
+            ProxyPhase::Running,
+            "port already used"
+        ));
+    }
 }

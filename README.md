@@ -116,6 +116,12 @@ from a half-parsed file: an unreadable config is logged and ignored.
   markers, and `range` over `parseNumberRange` / `parseNumberRangePair`. An
   unset variable stops the client and names it, rather than rendering Go's
   `<no value>` into a hostname.
+* A proxy whose name `frps` refuses — a second client on the same device, say —
+  is re-registered as `r1_<name>` rather than failing forever, and the domains
+  move with it. This is an **extension**: upstream frpc re-sends the same name
+  every thirty seconds and never gets in. On by default; `renameOnConflict =
+  false` turns it off. Note the consequence: a renamed proxy's public address
+  changes with its name.
 * `udpPacketSize` is honoured, and it is the length a datagram is *cut to* rather
   than the size of a buffer: a 2 000-byte reply from a local service arrives as
   1 500 bytes under the default, in this client and in Go's alike. A value outside

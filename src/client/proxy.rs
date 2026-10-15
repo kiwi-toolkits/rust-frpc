@@ -17,16 +17,23 @@ use crate::crypto::Secret;
 use crate::msg::NewProxy;
 use crate::naming;
 
-/// Builds the registration message for `proxy`.
+/// Builds the registration message for `proxy` under `candidate`.
 ///
-/// `name` overrides the proxy's configured name. It is what the rename-retry
-/// strategy will pass `ex_1_ssh` through when it is turned on; until then every
-/// caller passes `proxy.name`, and the work-connection lookup in the control loop
-/// matches on that same wire name.
-pub fn to_new_proxy(config: &ClientConfig, proxy: &ProxyConfig, name: &str) -> NewProxy {
+/// Usually `Candidate::Original`, which is the configured name untouched. When
+/// the rename-retry strategy has moved a proxy, `candidate` carries both the
+/// prefixed name **and** the prefix the domains need — one value, so the name and
+/// the domains it is reached by cannot be rewritten out of step with each other.
+///
+/// The configured name is never edited: it stays the key everywhere an operator
+/// looks (the admin API, the status list, the log prefix).
+pub fn to_new_proxy(
+    config: &ClientConfig,
+    proxy: &ProxyConfig,
+    candidate: crate::client::rename::Candidate,
+) -> NewProxy {
     let user = &config.common.user;
     let mut message = NewProxy {
-        proxy_name: naming::add_user_prefix(user, name),
+        proxy_name: naming::add_user_prefix(user, &candidate.name(&proxy.name)),
         // `wireType` when it is set, `type` otherwise. Only the registration is
         // affected; the local side follows `type`.
         proxy_type: proxy.wire_type_name().to_string(),
@@ -34,7 +41,15 @@ pub fn to_new_proxy(config: &ClientConfig, proxy: &ProxyConfig, name: &str) -> N
     };
 
     apply_qos(&mut message, proxy);
-    apply_kind(&mut message, proxy.kind());
+    if candidate == crate::client::rename::Candidate::Original {
+        apply_kind(&mut message, proxy.kind());
+    } else {
+        // A clone rather than an edit: `ProxyConfig::name` and the kind must stay
+        // as the file wrote them, for the admin API and for a reload.
+        let mut kind = proxy.kind().clone();
+        crate::client::rename::rewrite_domains(&mut kind, &candidate.prefix());
+        apply_kind(&mut message, &kind);
+    }
 
     message
 }
@@ -148,6 +163,7 @@ pub fn wire_name(config: &ClientConfig, name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::rename::Candidate;
     use crate::config::{ClientConfig, PluginConfig, ProxyTransport, Qos};
 
     fn config_with_user(user: &str) -> ClientConfig {
@@ -167,7 +183,7 @@ mod tests {
         let message = to_new_proxy(
             &config,
             &proxy("ssh", ProxyKind::Tcp { remote_port: 6000 }),
-            "ssh",
+            Candidate::Original,
         );
 
         assert_eq!(message.proxy_name, "alice.ssh");
@@ -181,38 +197,67 @@ mod tests {
         let message = to_new_proxy(
             &config,
             &proxy("ssh", ProxyKind::Tcp { remote_port: 6000 }),
-            "ssh",
+            Candidate::Original,
         );
         assert_eq!(message.proxy_name, "ssh");
     }
 
+    /// A renamed candidate replaces the name and keeps the user prefix.
     #[test]
-    fn the_rename_override_replaces_the_name_but_keeps_the_prefix() {
+    fn a_renamed_candidate_replaces_the_name_but_keeps_the_prefix() {
         let config = config_with_user("alice");
         let message = to_new_proxy(
             &config,
             &proxy("ssh", ProxyKind::Tcp { remote_port: 6000 }),
-            "ex_1_ssh",
+            Candidate::Renamed(1),
         );
-        assert_eq!(message.proxy_name, "alice.ex_1_ssh");
+        assert_eq!(message.proxy_name, "alice.r1_ssh");
+    }
+
+    /// The domains a routed proxy is reached by move with its name, which is the
+    /// only reason renaming an `http` proxy does anything useful.
+    #[test]
+    fn a_renamed_candidate_moves_the_domains_too() {
+        let config = config_with_user("");
+        let kind = ProxyKind::Http {
+            custom_domains: vec!["web.example.com".into()],
+            subdomain: "web".into(),
+            locations: Vec::new(),
+            http_user: String::new(),
+            http_password: String::new(),
+            host_header_rewrite: String::new(),
+            request_headers: None,
+            response_headers: None,
+            route_by_http_user: String::new(),
+        };
+        let p = proxy("web", kind.clone());
+        let message = to_new_proxy(&config, &p, Candidate::Renamed(2));
+
+        assert_eq!(message.proxy_name, "r2_web");
+        assert_eq!(message.custom_domains, vec!["r2_web.example.com"]);
+        assert_eq!(message.subdomain, "r2_web");
+        // And the config itself is untouched: the admin API and a reload both
+        // read it, and the operator's file must keep saying what it said.
+        assert_eq!(p.name, "web");
+        assert_eq!(p.kind().domains().0, &vec!["web.example.com".to_string()]);
+        assert_eq!(p.kind().domains().1, "web");
     }
 
     /// Registration and the work-connection lookup have to agree on the name.
     ///
     /// They are two different pieces of code — one builds `NewProxy`, the other
-    /// matches the `StartWorkConn` the server sends back against the configured
-    /// proxies — and the rename-retry strategy sits between them. As long as the
-    /// strategy is off, every caller must pass the configured name, or a work
-    /// connection arrives for a proxy nobody can find.
+    /// matches the `StartWorkConn` the server sends back — and the rename-retry
+    /// strategy sits between them. The loop resolves a work connection against
+    /// **every** name a proxy answers to (`Registered::answers_to`), not just the
+    /// one it is registered under now, because a rename can happen while a
+    /// request is in flight. This pins the un-renamed case, which is what every
+    /// proxy uses until a name is actually refused.
     #[test]
     fn a_registered_proxy_can_be_found_again_by_its_wire_name() {
         let config = config_with_user("alice");
         let p = proxy("ssh", ProxyKind::Tcp { remote_port: 6000 });
-        let message = to_new_proxy(&config, &p, &p.name);
+        let message = to_new_proxy(&config, &p, Candidate::Original);
 
-        // The same comparison the control loop makes when a `StartWorkConn`
-        // arrives, and with the same precedence: the proxy's *configured* name,
-        // not a rename override.
         let found = naming::add_user_prefix(&config.common.user, &p.name) == message.proxy_name;
         assert!(found, "{} is not findable again", message.proxy_name);
     }
@@ -225,11 +270,17 @@ mod tests {
         let mut p = proxy("hook", ProxyKind::Tcp { remote_port: 0 });
         p.wire_type = "virtual_net".into();
         assert_eq!(p.type_name(), "tcp");
-        assert_eq!(to_new_proxy(&config, &p, "hook").proxy_type, "virtual_net");
+        assert_eq!(
+            to_new_proxy(&config, &p, Candidate::Original).proxy_type,
+            "virtual_net"
+        );
 
         // And with no override the configured type is what goes out.
         let plain = proxy("ssh", ProxyKind::Tcp { remote_port: 6000 });
-        assert_eq!(to_new_proxy(&config, &plain, "ssh").proxy_type, "tcp");
+        assert_eq!(
+            to_new_proxy(&config, &plain, Candidate::Original).proxy_type,
+            "tcp"
+        );
     }
 
     #[test]
@@ -241,7 +292,7 @@ mod tests {
             bandwidth_limit_mode: "client".into(),
             ..ProxyTransport::default()
         });
-        let message = to_new_proxy(&config, &p, "ssh");
+        let message = to_new_proxy(&config, &p, Candidate::Original);
         assert_eq!(message.bandwidth_limit, "1MB");
         // Go omits it "to reduce traffic", and the server defaults to client.
         assert!(message.bandwidth_limit_mode.is_empty());
@@ -251,7 +302,7 @@ mod tests {
             ..ProxyTransport::default()
         });
         assert_eq!(
-            to_new_proxy(&config, &p, "ssh").bandwidth_limit_mode,
+            to_new_proxy(&config, &p, Candidate::Original).bandwidth_limit_mode,
             "server"
         );
     }
@@ -265,7 +316,7 @@ mod tests {
             use_compression: true,
             ..ProxyTransport::default()
         });
-        let message = to_new_proxy(&config, &p, "ssh");
+        let message = to_new_proxy(&config, &p, Candidate::Original);
         assert!(message.use_encryption);
         assert!(message.use_compression);
     }
@@ -280,7 +331,7 @@ mod tests {
         });
         p.qos_mut().metadatas.insert("region".into(), "eu".into());
 
-        let message = to_new_proxy(&config, &p, "ssh");
+        let message = to_new_proxy(&config, &p, Candidate::Original);
         assert_eq!(message.group, "g");
         assert_eq!(message.group_key, "k");
         assert_eq!(message.metas.get("region").map(String::as_str), Some("eu"));
@@ -308,7 +359,7 @@ mod tests {
             },
         );
 
-        let message = to_new_proxy(&config, &p, "web");
+        let message = to_new_proxy(&config, &p, Candidate::Original);
         assert_eq!(message.proxy_type, "http");
         assert_eq!(message.custom_domains, vec!["a.example.com"]);
         assert_eq!(message.subdomain, "web");
@@ -339,7 +390,7 @@ mod tests {
                 multiplexer: "httpconnect".into(),
             },
         );
-        let message = to_new_proxy(&config, &p, "mux");
+        let message = to_new_proxy(&config, &p, Candidate::Original);
         assert_eq!(message.proxy_type, "tcpmux");
         assert_eq!(message.multiplexer, "httpconnect");
         assert_eq!(message.custom_domains, vec!["tunnel"]);
@@ -356,7 +407,7 @@ mod tests {
                 allow_users: vec!["*".into()],
             },
         );
-        let message = to_new_proxy(&config, &p, "db");
+        let message = to_new_proxy(&config, &p, Candidate::Original);
         assert_eq!(message.sk, "s3cret");
         assert_eq!(message.allow_users, vec!["*"]);
     }
@@ -375,7 +426,7 @@ mod tests {
                 unix_path: "/var/run/docker.sock".into(),
             }),
         );
-        let message = to_new_proxy(&config, &p, "sock");
+        let message = to_new_proxy(&config, &p, Candidate::Original);
         assert_eq!(message.proxy_type, "tcp");
         assert_eq!(message.remote_port, 6003);
     }
@@ -388,7 +439,7 @@ mod tests {
         let message = to_new_proxy(
             &config,
             &proxy("ssh", ProxyKind::Tcp { remote_port: 6000 }),
-            "ssh",
+            Candidate::Original,
         );
         let json = String::from_utf8(crate::msg::go_json::to_vec(&message).unwrap()).unwrap();
         assert!(json.contains("\"proxy_name\":\"alice.ssh\""), "{json}");

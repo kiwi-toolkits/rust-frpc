@@ -6,6 +6,7 @@ pub mod control;
 pub mod login;
 pub mod manage;
 pub mod proxy;
+pub mod rename;
 pub mod sdk;
 pub mod service;
 pub mod session;

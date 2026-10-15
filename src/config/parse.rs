@@ -455,7 +455,7 @@ mod tests {
             config.common.metadatas.get("region").map(String::as_str),
             Some("eu")
         );
-        assert!(config.common.rename_on_conflict);
+        assert_eq!(config.common.rename_on_conflict, Some(true));
         assert_eq!(
             config.common.log.as_ref().unwrap().format.as_deref(),
             Some("json")

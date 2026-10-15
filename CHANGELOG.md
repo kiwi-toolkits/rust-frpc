@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+* **A proxy whose name is taken is re-registered under `r1_<name>`.** Not an frp
+  feature: upstream treats a name conflict as an ordinary start failure and
+  re-sends the same name every thirty seconds forever, so a second client on a
+  device that already runs one never comes up at all — which is the deployment
+  this was written for. The walk is `original ×2 → r1_ → r2_ → r3_ → original`,
+  three seconds a step and sixty before a new cycle, and it is on by default
+  because the case it fixes is a client that otherwise never starts.
+  `renameOnConflict = false` turns it off, and the legacy INI gains
+  `rename_on_conflict` so the two formats stay equivalent.
+* **`subdomain` and every `customDomains` entry move with the name.** Renaming
+  the proxy alone would trade a name conflict for a domain conflict and change
+  nothing: the domain is what `frps` routes an `http` proxy by. A wildcard keeps
+  its `*.` in front — `*.example.com` becomes `*.r1_example.com` — because the
+  router only matches a host that starts with `*.`, so the naive form would
+  register successfully and then route nothing, silently.
+* **A work connection resolves its proxy against the *current* names, not the
+  ones that were current when the connection was opened.** `frps` pools work
+  connections, so the task that offers one is spawned when the spare is announced
+  and the answer naming a proxy arrives only when a user takes it out of the
+  pool — minutes later, and possibly after a rename. With a spawn-time snapshot
+  the renamed proxy's connection was looked up under its old name and dropped,
+  leaving the user's own connection to hang until it timed out.
+* **A second `NewProxy` for a name that already succeeded is ignored rather than
+  renaming a working tunnel.** frps refuses a name that is in use without
+  checking who holds it, so the retry timer's duplicate of its own registration
+  comes back as `already exists` — and renaming a proxy because of that would
+  take a working tunnel away. Only a conflict reported against a proxy that is
+  not already `running` counts.
+
 * **Config templates.** Every config file frp loads goes through Go's
   `text/template` first — `config.LoadFileContentWithTemplate`, shared by TOML
   and legacy INI alike — with `.Envs` bound to the process environment. This

@@ -236,10 +236,18 @@ pub struct ClientCommonConfig {
     pub store: Option<StoreConfig>,
 
     // --- additions -------------------------------------------------------
-    /// Enables the rename-retry strategy. Off by default because it changes a
-    /// proxy's public name.
-    #[serde(rename = "renameOnConflict", skip_serializing_if = "is_false")]
-    pub rename_on_conflict: bool,
+    /// Enables the rename-retry strategy, which registers a proxy under
+    /// `r1_<name>` when `frps` says the name is taken. See [`crate::client::rename`].
+    ///
+    /// **On by default**, which is a behaviour change nothing in frp asks for —
+    /// upstream has no such strategy and simply retries the same name forever.
+    /// The reason it is on: the case it fixes is a device that already has a
+    /// client running, where the second one otherwise never comes up at all.
+    /// The cost is that a renamed proxy's public address changes with its name.
+    ///
+    /// `renameOnConflict = false` turns it off.
+    #[serde(rename = "renameOnConflict", skip_serializing_if = "Option::is_none")]
+    pub rename_on_conflict: TriState,
 }
 
 /// `transport` inside a proxy.
@@ -1167,6 +1175,9 @@ impl ClientConfig {
         if common.login_fail_exit.is_none() {
             common.login_fail_exit = Some(true);
         }
+        if common.rename_on_conflict.is_none() {
+            common.rename_on_conflict = Some(true);
+        }
         common.nat_hole_stun_server =
             empty_or(&common.nat_hole_stun_server, "stun.easyvoip.com:3478").to_string();
         common.udp_packet_size = if common.udp_packet_size == 0 {
@@ -1291,6 +1302,15 @@ impl ClientConfig {
             .and_then(|t| t.tls.as_ref())
             .and_then(|t| t.enable)
             .unwrap_or(true)
+    }
+
+    /// `renameOnConflict`, after defaults.
+    ///
+    /// The fallback is `true` rather than `false`, so a build that never calls
+    /// [`complete`](Self::complete) — a test, or a config assembled in code —
+    /// still gets the behaviour the docs describe.
+    pub fn rename_on_conflict(&self) -> bool {
+        self.common.rename_on_conflict.unwrap_or(true)
     }
 }
 

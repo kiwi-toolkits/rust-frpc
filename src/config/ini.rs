@@ -292,7 +292,14 @@ fn common_from_ini(section: &BTreeMap<String, String>) -> Result<ClientCommonCon
         metadatas,
         includes: split("includes"),
         store,
-        rename_on_conflict: false,
+        // `None` when the key is absent, not `false`. The feature is on by
+        // default, and a `get_bool`-style helper would return `false` for a
+        // missing key — silently turning it off for every legacy INI config,
+        // which is the opposite of what the default says. Same shape as
+        // `login_fail_exit` just above.
+        rename_on_conflict: section
+            .get("rename_on_conflict")
+            .map(|value| value.trim() == "true"),
     })
 }
 
