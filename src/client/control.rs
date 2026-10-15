@@ -329,18 +329,14 @@ impl Control {
         mut restart: tokio::sync::watch::Receiver<bool>,
         events: Option<mpsc::Sender<ControlEvent>>,
     ) -> Result<()> {
-        logging::log_at(
-            logging::Level::Info,
-            logging::callers::PROXY_ADDED,
-            format!(
-                "proxy added: {}",
-                self.proxies
-                    .iter()
-                    .map(|proxy| proxy.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        );
+        logging::info(format!(
+            "proxy added: {}",
+            self.proxies
+                .iter()
+                .map(|proxy| proxy.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
 
         for index in 0..self.proxies.len() {
             if let Err(err) = self.announce(index).await {
@@ -622,20 +618,15 @@ impl Control {
             // The remote address is this client's addition: frp's own line is
             // just the success, and the address is what an operator has to run
             // `frpc status` to find.
-            log.at(
-                logging::Level::Info,
-                logging::callers::PROXY_START,
-                format!("start proxy success, remote address: {}", resp.remote_addr),
-            );
+            log.info(format!(
+                "start proxy success, remote address: {}",
+                resp.remote_addr
+            ));
             status.phase = ProxyPhase::Running;
             status.remote_addr = resp.remote_addr;
             status.error.clear();
         } else {
-            log.at(
-                logging::Level::Warn,
-                logging::callers::PROXY_START_ERROR,
-                format!("start error: {}", resp.error),
-            );
+            log.warn(format!("start error: {}", resp.error));
             status.phase = ProxyPhase::StartError;
             status.error = resp.error;
         }

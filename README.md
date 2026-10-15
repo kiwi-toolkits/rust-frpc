@@ -110,6 +110,12 @@ from a half-parsed file: an unreadable config is logged and ignored.
   A `sudp` session belongs to the visitor rather than to a user: the first datagram
   opens it, later datagrams from any user ride on it, and each carries the address
   it came from, which is how the answer gets back to the right one.
+* Config files are templated the way frp templates them, with `.Envs` bound to
+  the process environment: `server_addr = "{{ .Envs.FrpsIP }}"`, a variable
+  inside a larger token (`[hq{{.Envs.MacAddr}}]`), the `{{-` / `-}}` trim
+  markers, and `range` over `parseNumberRange` / `parseNumberRangePair`. An
+  unset variable stops the client and names it, rather than rendering Go's
+  `<no value>` into a hostname.
 * `udpPacketSize` is honoured, and it is the length a datagram is *cut to* rather
   than the size of a buffer: a 2 000-byte reply from a local service arrives as
   1 500 bytes under the default, in this client and in Go's alike. A value outside
@@ -124,9 +130,11 @@ from a half-parsed file: an unreadable config is logged and ignored.
   converted and run, and only `xtcp` is reported as skipped. A visitor with no
   `bindAddr` gets `127.0.0.1`, as `CompleteVisitorConfigurers` gives it — without
   that it would bind every interface.
-* Logging matches `golib`: `2006-01-02 15:04:05.000 [I] [service.go:332] [runID] …`,
-  with the one-letter level, the upstream Go caller site, and the run-id and
-  proxy-name prefixes. `log.to` writes a daily-rotated file and honours
+* Logging keeps `golib`'s shape: `2006-01-02 15:04:05.000 [I] [client/login.rs:108]
+  [runID] …` — the one-letter level, a caller column, and the run-id and
+  proxy-name prefixes. The caller is **this** implementation's location rather
+  than frp's: printing `[service.go:332]` for a file that is not in this tree
+  reads as a bug to anyone who goes looking for it. `log.to` writes a daily-rotated file and honours
   `maxDays`; `log.disablePrintColor` turns the console colours off. The legacy
   INI spellings (`log_file`, `log_level`, `log_max_days`, `disable_log_color`)
   mean the same thing, which is also what Go's converter does with them.

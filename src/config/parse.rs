@@ -17,6 +17,7 @@ use crate::error::{Error, Result};
 use super::ini;
 use super::keys;
 use super::model::ClientConfig;
+use super::template;
 
 /// Which parser handled a file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,7 +62,16 @@ pub fn load_file(path: &Path) -> Result<LoadedConfig> {
 pub fn load_file_with(path: &Path, strictness: Strictness) -> Result<LoadedConfig> {
     let content = std::fs::read_to_string(path)
         .map_err(|err| Error::config(format!("read {}: {err}", path.display())))?;
-    let mut loaded = load_from_str_with(&content, strictness).map_err(|err| match err {
+    // Templated before anything looks at the format, which is the order frp
+    // uses: one `text/template` pass over the raw text, shared by TOML and
+    // legacy INI alike (`config.LoadFileContentWithTemplate`). Doing it later
+    // would mean the format detector and the parser both had to understand
+    // `{{ }}`.
+    let rendered = template::render(&content).map_err(|err| match err {
+        Error::Config(message) => Error::Config(format!("{}: {message}", path.display())),
+        other => other,
+    })?;
+    let mut loaded = load_from_str_with(&rendered, strictness).map_err(|err| match err {
         // Carry the path, since the parser only knows about the text.
         Error::Config(message) => Error::Config(format!("{}: {message}", path.display())),
         other => other,

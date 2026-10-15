@@ -105,11 +105,10 @@ pub async fn login_over(
         return Err(Error::Login(resp.error));
     }
 
-    logging::Prefixed::new(&resp.run_id).at(
-        logging::Level::Info,
-        logging::callers::LOGIN_SUCCESS,
-        format!("login to server success, get run id [{}]", resp.run_id),
-    );
+    logging::Prefixed::new(&resp.run_id).info(format!(
+        "login to server success, get run id [{}]",
+        resp.run_id
+    ));
 
     // Everything after the login is encrypted, which is unconditional — not
     // something `useEncryption` turns on.

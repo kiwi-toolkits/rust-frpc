@@ -2,6 +2,43 @@
 
 ## Unreleased
 
+* **Config templates.** Every config file frp loads goes through Go's
+  `text/template` first — `config.LoadFileContentWithTemplate`, shared by TOML
+  and legacy INI alike — with `.Envs` bound to the process environment. This
+  client did not, so a config saying `server_port = {{.Envs.FrpsPort}}` was read
+  literally and failed with `server_port is not a number: {{.Envs.FrpsPort}}`.
+  That is not a hypothetical: it is why a deployment to a device failed to
+  start, silently, because the start script sends the client's output to
+  `/dev/null`.
+* **The subset implemented is the subset config files use**, taken from frp's
+  README and its own fixtures: `{{ .Envs.NAME }}` (with a variable allowed
+  inside a larger token, which is what makes `[hq{{.Envs.MacAddr}}]` work), the
+  `{{-` / `-}}` whitespace trim markers, and `range` over `parseNumberRange` /
+  `parseNumberRangePair` with `$v.First` / `$v.Second`. Anything outside it is an
+  error that names the action, because a config that kept its `{{ }}` would fail
+  later with a message about a port that is not a number — the failure this
+  replaces.
+* **An unset variable is an error, not an empty string.** `{{.Envs.FrpsIP}}`
+  with no `FrpsIP` in the environment stops the client and says so. Go's
+  `text/template` renders it as `<no value>`, which for `server_addr` produces a
+  client that tries to resolve a hostname called `<no value>`.
+* **The log's caller column now names a file that exists.** It printed Go's
+  `[service.go:332]` and friends for the messages that reproduce a Go one, which
+  reads as a bug to anyone who goes looking for `service.go` — it is not in this
+  tree. Every record now carries this implementation's own location, taken from
+  `#[track_caller]`: `[client/service.rs:221]`. The column itself stays, because
+  it is part of frp's log format; only the values changed. The `callers` map and
+  `log_at` are gone with it.
+* **The version string is `rs-0.1.0`.** It was `0.71.0-rust-frpc.0.1.0`, which
+  was long for the one place it is actually read — a dashboard — and the leading
+  number was there for a reason that no longer applies to the servers this is
+  deployed against. That reason is worth stating, because it is a real loss:
+  every `frps` up to 0.54 compares the string's second `.`-separated field
+  against `18`, so `rs-0.1.0` is read as `1` and refused with "Please upgrade
+  your frpc version to at least 0.18.0". The check was dropped in 0.55. The
+  trade is recorded in `src/version.rs` and pinned by a test that asserts the
+  incompatibility, so it cannot be forgotten or "fixed" by accident.
+
 * **`rust-frpc.0.1.0` was rejected by any `frps` up to 0.54.** The version string
   in `Login` is not decoration: those servers call `version.Compat`, which splits
   it on `.` and compares field *n* against field *n* of `0.18.0`. A string whose

@@ -99,14 +99,19 @@ curl localhost:7400/metrics  # 纯文本计数器
 * legacy INI 里 `role = visitor` 的段会真正转换成 visitor 并启动（`stcp`/`sudp`），只有
   `xtcp` 会被记录并跳过。未指定 `bindAddr` 的 visitor 默认 `127.0.0.1`，与
   `CompleteVisitorConfigurers` 一致——否则空主机名会把端口绑到所有网卡上。
+* 配置文件支持 frp 的模板语法，`.Envs` 绑定进程环境变量：`server_addr = "{{ .Envs.FrpsIP }}"`、
+  变量嵌在更大的 token 里（`[hq{{.Envs.MacAddr}}]`）、`{{-` / `-}}` 空白裁剪标记，以及
+  `range` 配合 `parseNumberRange` / `parseNumberRangePair`。变量未定义会**停下并点名**，
+  而不是渲染成 Go 的 `<no value>` 塞进主机名里。
 * `udpPacketSize` 已生效，它的含义是**数据报被截断到的长度**，而不是缓冲区大小：本地服务回一个
   2000 字节的应答，在默认值下到达时是 1500 字节——本客户端与 go 版行为一致。取值超出
   `1..=65507` 会被夹紧并给出警告，而不是照办：go 版的 `0` 会把每个数据报都读成空的。
   另一处有意为之的差异记在 `doc/compatibility.md`。
 * 本地侧跑不了的代理（`xtcp`、未实现的插件、或本客户端不支持的 `wireType`）会被记录并跳过，
   不会因为其中一个而让配置文件里的其它隧道一起失效。`--check-config` 在部署前就会给出同样的提示。
-* 日志与 `golib` 对齐：`2006-01-02 15:04:05.000 [I] [service.go:332] [runID] …`，级别是单字母，
-  带上游 Go 的调用位置，以及 runID / proxyName 前缀。`log.to` 会写按天轮转的文件并遵守
+* 日志保持 `golib` 的**形状**：`2006-01-02 15:04:05.000 [I] [client/login.rs:108] [runID] …`，
+  级别是单字母，带调用位置列，以及 runID / proxyName 前缀。调用位置是**本实现自己的**位置，
+  不是 frp 的：对一个本仓库里根本不存在的文件打 `[service.go:332]`，谁去翻都会当成 bug。`log.to` 会写按天轮转的文件并遵守
   `maxDays`，`log.disablePrintColor` 关闭控制台配色。legacy INI 的 `log_file`、`log_level`、
   `log_max_days`、`disable_log_color` 含义相同，Go 的转换器也是这么处理的。
 * 以下能力尚未接通，且都是**明确拒绝而非半成品**：线协议 `v2`（`msg.rs` 里有分帧实现，

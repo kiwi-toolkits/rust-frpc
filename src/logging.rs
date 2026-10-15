@@ -243,24 +243,17 @@ pub fn log(level: Level, message: impl AsRef<str>) {
     emit(level, &here(), "", message.as_ref());
 }
 
-/// The same, with the upstream Go caller site attached.
-///
-/// `caller` is a Go `file:line`, taken from [`callers`], for the messages that
-/// deliberately reproduce a Go one. Passing it explicitly keeps the map next to
-/// the call it describes instead of keyed on line numbers that every edit would
-/// invalidate.
-pub fn log_at(level: Level, caller: &str, message: impl AsRef<str>) {
-    emit(level, caller, "", message.as_ref());
-}
-
 /// Where in *this* implementation a record came from, as `[file.rs:line]`.
 ///
 /// Go's `getCallerPrefix` trims to the last two path components, and the same
-/// trim here gives `[client/service.rs:545]`. That is not a line that exists in
-/// frp, and it does not pretend to be: the messages that reproduce a Go line
-/// carry that line explicitly through [`log_at`], and everything else says where
-/// it really came from. A blank column would be worse than either, because it
-/// reads as a bug in the logger rather than as information.
+/// trim here gives `[client/service.rs:545]`. The column is part of frp's log
+/// format, so it stays — but it points at *this* implementation, because a file
+/// name that does not exist in this tree is worse than no information at all.
+/// An earlier version printed the Go line for messages that reproduced a Go one,
+/// which read as a bug to anyone who went looking for `service.go`.
+///
+/// A blank column would be the other wrong answer: it reads as a logger fault
+/// rather than as information.
 #[track_caller]
 fn here() -> String {
     let location = std::panic::Location::caller();
@@ -349,11 +342,6 @@ impl Prefixed {
     pub fn error(&self, message: impl AsRef<str>) {
         emit(Level::Error, &here(), &self.prefix, message.as_ref());
     }
-
-    /// The same with an upstream caller site attached.
-    pub fn at(&self, level: Level, caller: &str, message: impl AsRef<str>) {
-        emit(level, caller, &self.prefix, message.as_ref());
-    }
 }
 
 #[track_caller]
@@ -395,39 +383,6 @@ fn escape_json(input: &str) -> String {
         }
     }
     out
-}
-
-/// The upstream `file:line` a Rust call site corresponds to.
-///
-/// Hand-maintained, and deliberately so: the value cannot be derived, and a
-/// stale guess would be worse than none. Each entry is what Go's own
-/// `getCallerPrefix` would print for that line — its `trimmedPath` keeps the
-/// last two path components, so `cmd/frpc/sub/root.go:194` prints as
-/// `sub/root.go:194` and `client/proxy/proxy_manager.go:183` as
-/// `proxy/proxy_manager.go:183`.
-///
-/// Only messages that reproduce a Go one belong here. Everything else takes the
-/// caller from [`here`], which points at this implementation, because inventing
-/// a Go line for a message frp never prints would be a lie in the one field an
-/// operator uses to find their way back to the source.
-pub mod callers {
-    /// `log.Infof("start frpc service for config file [%s] with aggregated configuration", cfgFile)`
-    pub const START: &str = "[sub/root.go:194]";
-    /// `defer log.Infof("frpc service for config file [%s] stopped", cfgFile)`
-    pub const STOP: &str = "[sub/root.go:195]";
-    /// `xl.Infof("try to connect to server...")`
-    #[allow(dead_code)]
-    pub const LOGIN_TRY: &str = "[service.go:312]";
-    /// `xl.Warnf("connect to server error: %v", err)`
-    pub const LOGIN_ERROR: &str = "[service.go:323]";
-    /// `xl.Infof("login to server success, get run id [%s]", svr.runID)`
-    pub const LOGIN_SUCCESS: &str = "[service.go:332]";
-    /// `xl.Infof("proxy added: %s", addPxyNames)`
-    pub const PROXY_ADDED: &str = "[proxy/proxy_manager.go:183]";
-    /// `xl.Infof("[%s] start proxy success", proxyName)`
-    pub const PROXY_START: &str = "[control.go:174]";
-    /// `xl.Warnf("[%s] start error: %v", proxyName, err)`
-    pub const PROXY_START_ERROR: &str = "[control.go:172]";
 }
 
 /// A file that moves aside at midnight and deletes its older backups.

@@ -17,6 +17,7 @@ mod ini;
 mod keys;
 mod model;
 mod parse;
+mod template;
 mod validate;
 
 pub use model::{

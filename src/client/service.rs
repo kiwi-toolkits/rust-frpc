@@ -218,14 +218,10 @@ async fn serve(
         .as_ref()
         .filter(|path| !path.as_os_str().is_empty())
     {
-        logging::log_at(
-            logging::Level::Info,
-            logging::callers::START,
-            format!(
-                "start frpc service for config file [{}] with aggregated configuration",
-                path.display()
-            ),
-        );
+        logging::info(format!(
+            "start frpc service for config file [{}] with aggregated configuration",
+            path.display()
+        ));
     }
 
     // The first login. `loopLoginUntilSuccess(10*time.Second, loginFailExit)`:
@@ -254,11 +250,9 @@ async fn serve(
                 // error:` is what a runbook or a log parser is keyed on, and
                 // dropping it to say something more descriptive would break
                 // that for no gain. The delay is the addition.
-                logging::log_at(
-                    logging::Level::Warn,
-                    logging::callers::LOGIN_ERROR,
-                    format!("connect to server error: {err}, retrying in {delay:?}"),
-                );
+                logging::warn(format!(
+                    "connect to server error: {err}, retrying in {delay:?}"
+                ));
                 if !sleep_or_shutdown(delay, &mut stop_rx).await {
                     return Ok(());
                 }
@@ -351,7 +345,7 @@ async fn serve(
                     }
                     None => "frpc service stopped".to_string(),
                 };
-                logging::log_at(logging::Level::Info, logging::callers::STOP, message);
+                logging::info(message);
                 return Ok(());
             }
             SessionEnd::Reload => {
@@ -432,11 +426,9 @@ async fn login_again(
                     return Err(err);
                 }
                 let delay = backoff.next(true);
-                logging::log_at(
-                    logging::Level::Warn,
-                    logging::callers::LOGIN_ERROR,
-                    format!("connect to server error: {err}, retrying in {delay:?}"),
-                );
+                logging::warn(format!(
+                    "connect to server error: {err}, retrying in {delay:?}"
+                ));
                 if !sleep_or_shutdown(delay, shutdown).await {
                     return Ok(());
                 }
